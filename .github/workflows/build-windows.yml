@@ -1,0 +1,60 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - win
+
+jobs:
+  build-win:
+    # windows-2022:node-gyp 在 VS2026(windows-latest 现在指向 windows-2025-vs2026)上
+    # 找不到匹配的工具链,构建会失败 —— 这条线固定用 windows-2022。
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Electron 41 内置 Node 22;Actions 上的 Node 20 已进入退役期
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build native addon + renderer + NSIS installer
+        run: npm run dist:win
+
+      # 硬门禁:原生模块必须解包且能加载。
+      # 这一条拦的是"装上之后 App 起不来"的老坑(原生模块被塞进 asar,
+      # 顶层 require 直接抛错 → 主进程崩溃),见 ADR-0003。
+      - name: Verify packaged app
+        run: node tools/verify/verify-package-win.cjs
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Campus-Network-Connector-Win
+          path: release/**/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $EXE = Get-ChildItem -Path release -Recurse -Filter *.exe | Select-Object -First 1
+          if (-not $EXE) {
+            Write-Error "No .exe found under release/"
+            exit 1
+          }
+          $TAG = "win-${{ github.run_id }}"
+          $TITLE = "Windows build ${{ github.run_id }} (${{ github.ref_name }})"
+          $NOTES_FILE = [System.IO.Path]::GetTempFileName()
+          Set-Content -Path $NOTES_FILE -Value "Auto-built Windows exe. Branch: ${{ github.ref_name }}  Commit: ${{ github.sha }}" -Encoding UTF8
+          gh release create $TAG "$($EXE.FullName)" --title $TITLE --notes-file $NOTES_FILE --prerelease
