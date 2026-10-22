@@ -22,7 +22,7 @@ const { SafariBridge } = require('./bridge');
 const { GlyphEngine } = require('./engine');
 
 const DEFAULT_INTERVAL_MS = 300;
-const MAX_BACKOFF_MS = 15000;
+const MAX_BACKOFF_MS = 4000;
 /** 每隔几轮复查一次"被看住的标签" */
 const WATCH_EVERY_ROUNDS = 10;
 /** 每隔几轮处理一次"命中目标站点"的标签 */
@@ -232,6 +232,11 @@ class InjectorCoordinator {
     if (!this.enabled || this.fastRunning || !this.cipherTabs.size) return;
     this.fastRunning = true;
     try {
+      // 同上:Safari 没开就别去碰它(否则会被 Apple Event 启动)
+      const safariRunning = await this.bridge.isRunning();
+      this.state.safariRunning = safariRunning;
+      if (!safariRunning) return;
+
       for (const [key, info] of [...this.cipherTabs]) {
         try {
           const r = await this.processTab(info.tabIndex, info.windowIndex, key);
@@ -259,6 +264,7 @@ class InjectorCoordinator {
       this.state.injected = false;
       return { action: 'evaluate-failed' };
     }
+
 
     // 标签可能被关掉/换位 → 用 URL 校验
     const watchKey = tabIndex === null || tabIndex === undefined ? 'front' : tabIndex;
@@ -357,6 +363,17 @@ class InjectorCoordinator {
     if (!this.enabled) return { action: 'disabled' };
     if (this.running) return { action: 'busy' };
     if (Date.now() < this.backoffUntil) return { action: 'backoff' };
+
+    // Safari 在不在?不在就**安静跳过这一轮** ——
+    // 任何对 Safari 的 Apple Event 都会把它启动起来,而我们要的是
+    // "浏览器开着就生效",不是"帮用户把浏览器拉起来"。
+    const safariRunning = await this.bridge.isRunning();
+    this.state.safariRunning = safariRunning;
+    if (!safariRunning) {
+      this.state.injected = false;
+      this.state.lastError = '';
+      return { action: 'safari-not-running' };
+    }
 
     this.running = true;
     this.state.running = true;

@@ -18,6 +18,8 @@ export default function FeatureToggles({ featureList, featureStatus, onToggle })
     // 失败原因必须露出来:后台把错误记在 lastError 里,但界面不显示,
     // 用户只看到"已开启"却什么都没发生,根本无从判断是权限还是别的问题。
     const err = st && st.lastError ? String(st.lastError) : ''
+    // Safari 没开是**中性状态**,不是故障:打开 Safari 后会自动接管。
+    const safariOff = !!(st && st.safariRunning === false)
     const needsAutomation = /not authorized|-1743|自动化|automation/i.test(err)
     return (
       <div key={f.id} className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-2">
@@ -34,6 +36,11 @@ export default function FeatureToggles({ featureList, featureStatus, onToggle })
             {on ? '关闭' : '开启'}
           </button>
         </div>
+        {safariOff ? (
+          <div className="mt-1.5 text-xs text-gray-600">
+            Safari 未运行 —— 打开 Safari 后会自动接管(本软件不会替你启动它)。
+          </div>
+        ) : null}
         {err ? (
           <div className="mt-1.5 text-xs text-red-700 break-words">
             失败原因:{err}
