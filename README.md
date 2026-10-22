@@ -1,5 +1,18 @@
 # 模拟输入 (Campus Network Connector)
 
+> **本仓库是同一个产品的两个正式版本之一,和 Tauri 版同等优先。**
+> 两个版本都是正式产品,区别只在**技术栈**,不存在"新版本取代旧版本"的关系:
+>
+> | | 版本 | 技术栈 | 仓库 |
+> | --- | --- | --- | --- |
+> | 本仓库 | **Electron 版** | Node.js + Chromium + `.node` 原生插件 | `Campus-Network-Connector-Electron` |
+> | 另一个仓库 | **Tauri 版** | Rust + 系统 WebView,**无 Node、无 `.node` 插件** | [`Campus-Network-Connector-Tauri`](https://github.com/GOJOCLOUD/Campus-Network-Connector-Tauri) |
+>
+> 两个仓库各有 `mac` / `win` 两条分支,各自出各自的包,**不互相回流**:
+> 一边要另一边的改动必须**显式搬运**。
+> 平台范围口径(哪个平台做什么、哪些能力明确不做)见
+> **[ADR-0012](docs/06-决策/ADR-0012-平台功能范围-macOS全量-Windows精简.md)**。
+
 **Windows 版**:激活之后回放录制的操作序列(校园网自动登录这类场景)——
 在别的 App 里代替你操作:**模拟点击 / 输入 / 按键**。
 
@@ -11,22 +24,26 @@ macOS 版在这之上还多两样:**切换输入法**、**录制操作序列**,
 
 | 线 | 分支 | 产物 | 原生模块 | 界面步骤 |
 | --- | --- | --- | --- | --- |
-| macOS | `mac` | DMG | `mac-coregraphics`(CoreGraphics) | 激活 → 默认执行 → 模拟点击 → 键盘输入 |
-| Windows | `win` | NSIS exe | `win-input`(Win32) | 激活 → 默认执行 |
+| macOS | `mac` | `.app` + zip | `mac-coregraphics`(CoreGraphics) | 激活 → 默认执行 → 模拟点击 → 键盘输入 |
+| Windows | `win` | NSIS `.exe` | `win-input`(Win32) | 激活 → 默认执行 |
 
 **两个平台不共用一个打包入口**:各自分支、各自的 `package.json` 打包配置、各自的
 GitHub Actions workflow。macOS 的包不含任何 Windows 专属的东西,Windows 的包也不含
 macOS 专属的东西(Safari 复制修复走 Apple Events,只有 macOS 有)。
 
 **两条线从 2026-10-21 起不再同步推进,也不再保持一模一样**:各自的功能、界面、实现
-各自演化,一边想用另一边的改动必须显式搬过去。仓库里有两个 Agent 在并行推进,
-详细边界与协作约定见 **[docs/00-概览/两条发布线.md](docs/00-概览/两条发布线.md)**。
+各自演化,一边想用另一边的改动必须显式搬过去。两个仓库(本仓库与 Tauri 版仓库)
+各自维护、各自发布,详细边界与协作约定见 **[docs/00-概览/两条发布线.md](docs/00-概览/两条发布线.md)**。
 
-Windows 上**没有「模拟点击(录制)」和「键盘输入(快捷输入)」**——它们依赖 macOS 原生能力
-(全局事件监听 / 输入源切换),在 Windows 上跑不通,业务上也不需要;录制文件的
-挑选 / 重命名 / 删除保留在「默认执行」这一步的「管理」入口里。
+Windows 版的界面是**精简版**:只保留「激活 + 默认执行(回放/挑文件)」,没有
+「模拟点击(录制)」这一步(它依赖全局事件监听)。原生模块 `win-input` 本身具备
+Unicode 逐字键入能力(`KEYEVENTF_UNICODE`),Windows 线的目标范围按
+**[ADR-0012](docs/06-决策/ADR-0012-平台功能范围-macOS全量-Windows精简.md)**:
+保留**拼音自动键入**与**默认执行(回放)**,浏览器字体纠正走 Chrome/Edge 扩展
+(`npm run build:core` → `dist-core/chromium/`),**独立于桌面应用**。
+录制文件的挑选 / 重命名 / 删除保留在「默认执行」这一步的「管理」入口里。
 
-> 旧的 `win` 分支已废弃:代码停在 2026-07 之前,原生模块还塞在 asar 里(装上就崩)。
+> 本仓库的 `mac` / `win` 两条分支**都是当前在用的**:分别出 macOS 包与 Windows 包。
 
 ## 快速上手
 
