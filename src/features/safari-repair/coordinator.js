@@ -124,7 +124,10 @@ class InjectorCoordinator {
     this.startFastPoll();
     this.timer = setInterval(() => {
       this.tick().catch((error) => {
-        this.state.lastError = String(error && error.message ? error.message : error);
+        const message = String(error && error.message ? error.message : error);
+        this.state.lastError = message;
+        // 也要进主进程日志:打包版没有终端可看,日志是唯一能远程核对的地方
+        this.log('Safari 修复失败:' + message);
       });
     }, this.intervalMs);
     if (this.timer.unref) this.timer.unref();
