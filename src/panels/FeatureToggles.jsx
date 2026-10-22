@@ -15,6 +15,10 @@ export default function FeatureToggles({ featureList, featureStatus, onToggle })
         : st.injected
           ? '已接管'
           : '已开启'
+    // 失败原因必须露出来:后台把错误记在 lastError 里,但界面不显示,
+    // 用户只看到"已开启"却什么都没发生,根本无从判断是权限还是别的问题。
+    const err = st && st.lastError ? String(st.lastError) : ''
+    const needsAutomation = /not authorized|-1743|自动化|automation/i.test(err)
     return (
       <div key={f.id} className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-2">
         <div className="flex items-center justify-between gap-3">
@@ -30,6 +34,17 @@ export default function FeatureToggles({ featureList, featureStatus, onToggle })
             {on ? '关闭' : '开启'}
           </button>
         </div>
+        {err ? (
+          <div className="mt-1.5 text-xs text-red-700 break-words">
+            失败原因:{err}
+            {needsAutomation ? (
+              <span className="block mt-0.5">
+                若提示没有自动化权限:系统设置 → 隐私与安全性 → 自动化 → 找到本应用 → 打开 Safari 开关;
+                若是 Safari 侧:开发菜单 → 允许来自 Apple Events 的 JavaScript。
+              </span>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     )
   })}
