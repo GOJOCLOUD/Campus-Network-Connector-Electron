@@ -527,6 +527,26 @@ function playbackBusy() {
   return playbackGuard.isBusy();
 }
 
+// 回放期间让窗口**穿透**(不接收鼠标事件),返回有没有成功。
+//
+// ## 为什么必须有它
+//
+// App 的窗口是 always-on-top 的小面板,**常常正好盖在目标网站的输入框上面**。
+// 回放要点击的位置如果落在自己窗口上:
+// - 不穿透 ⇒ 那个点击变成**点自己** ⇒ 点中自己的「默认执行」⇒ 又一次回放
+//   ⇒ **无限自激循环**(2026-10-23 T0)⇒ 疯狂键入 ⇒ 机器卡死。
+//
+// 穿透成功 ⇒ 点击**正常落到下面的应用** ⇒ 既不自激,回放也完整。
+function setWindowPassthrough(ignore) {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    mainWindow.setIgnoreMouseEvents(ignore, { forward: true });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function playClicks(clicks, interval, inputs) {
   const perClickInputs = Array.isArray(inputs)
     ? inputs.map(i => (i && String(i).trim()) ? String(i).trim() : null)
@@ -537,6 +557,9 @@ async function playClicks(clicks, interval, inputs) {
     console.error(`[playback] 上一次回放还没结束,这次没有重复执行(已拒绝 ${playbackGuard.rejectedCount()} 次)`);
     return { executed: 0, skipped: 0, rejected: true };
   }
+  // **窗口穿透**:回放期间让窗口不接收鼠标事件,
+  // 这样回放的点击能落到下面的目标应用上(见 setWindowPassthrough 的说明)。
+  const penetrated = setWindowPassthrough(true);
   let executed = 0;
   try {
     for (let i = 0; i < clicks.length; i++) {
@@ -555,6 +578,8 @@ async function playClicks(clicks, interval, inputs) {
       }
     }
   } finally {
+    // 窗口恢复可点 —— 不恢复的话,用户会以为界面坏了。
+    setWindowPassthrough(false);
     // 哪怕中途抛错,也要把闸放开,否则回放再也起不来。
     playbackGuard.finish();
   }
