@@ -127,9 +127,29 @@ class SafariBridge {
   /**
    * 一轮状态采集：**一次 Apple Event 拿到全部信息**。
    * 返回 { guard, pending, frames, unrepaired, collect }
+   *
+   * `resync: true` 时，先让页面里的守卫**把已知作用域重新报一遍**。
+   * App 刚启动时必须做：页面里还留着上一任 App 下发的映射，
+   * 守卫会以为"不用报" → App 永远学不到这个作用域 →
+   * 也就不会登记这个标签 → **快通道根本不盯它** →
+   * 换题之后只能等主通道那一圈（~1.2 秒），用户"换题立刻复制"就复制出密文。
+   *
+   * **必须走 bridge**：它把这一声喊到**所有 frame**——
+   * 真正带混淆字体的往往是嵌套 frame（学习通在第 3~4 层），
+   * 只喊顶层等于没喊（顶层通常压根没有自定义字体）。
+   *
+   * 顺序：必须在下面的 collect/take **之前** ——
+   * 这样重新报上来的作用域在**同一次** Apple Event 里就被收走。
    */
-  pollState({ tabIndex = null, windowIndex = null } = {}) {
+  pollState({ tabIndex = null, windowIndex = null, resync = false } = {}) {
     const target = this.target(tabIndex, windowIndex);
+    const resyncJs = resync
+      ? `try {
+        var rb = window.__copyRepairBridge;
+        if (rb && typeof rb.resync === 'function') { out.resync = rb.resync(); }
+        else if (typeof window.__copyRepairResync === 'function') { window.__copyRepairResync(); out.resync = 1; }
+      } catch (e) { }`
+      : '';
     const js = `(function(){
       var g = window.__copyRepairGuard;
       var out = {
@@ -138,8 +158,10 @@ class SafariBridge {
         collect: 'none',
         frames: [],
         unrepaired: [],
+        resync: 0,
         url: String(location.href || ''),
       };
+      ${resyncJs}
       if (g) {
         if (window.__copyRepairCollect) {
           try { out.collect = String(window.__copyRepairCollect()); } catch (e) { out.collect = 'error'; }

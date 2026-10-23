@@ -197,6 +197,16 @@ class GlyphEngine {
     this.fontCache = new Map();
     /** 字体下载失败 -> { at, message }（负缓存，冷却期内不重复请求） */
     this.fontFailCache = new Map();
+    /**
+     * 字体**解析/分析**失败 -> { at, message }（负缓存，冷却期内不重复解析）
+     *
+     * 它和 fontFailCache 不是一回事：站点的 @font-face 经常指向一个
+     * **返回 HTML 错误页**的 URL（实测学习通的 icomoon.ttf 返回 529 字节 HTML）。
+     * 那种 URL **下载是"成功"的**（HTTP 200、字节非空），
+     * 所以"下载失败负缓存"抓不到它 —— 每轮都要重新下载一次（实测 130~160ms）
+     * 再解析一遍，白白吃掉一整轮的时间。
+     */
+    this.fontAnalysisFailCache = new Map();
   }
 
   /** 加载指定参考库（按文件路径缓存），并建好快速匹配器 */
@@ -259,6 +269,23 @@ class GlyphEngine {
     }
   }
 
+  /** 记一次字体解析失败（key = URL 或字体内容哈希），冷却期内不再重复解析 */
+  rememberFontAnalysisFailure(key, message) {
+    this.fontAnalysisFailCache.set(key, { at: Date.now(), message });
+    while (this.fontAnalysisFailCache.size > DEFAULTS.maxCachedFonts) {
+      const oldest = this.fontAnalysisFailCache.keys().next().value;
+      this.fontAnalysisFailCache.delete(oldest);
+    }
+  }
+
+  /** 取一次字体解析失败（冷却期内才有；过期了要重新试，因为可能是临时故障） */
+  fontAnalysisFailure(key) {
+    const hit = this.fontAnalysisFailCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.at >= DEFAULTS.fontFailCooldownMs) return null;
+    return hit.message;
+  }
+
   /**
    * 解析字体并得出"码位 → 可见字"的对照表。
    * @returns {Map<number, {plain:number|null, score:number, margin:number, selfDistance:number, alts:Array}>}
@@ -267,10 +294,19 @@ class GlyphEngine {
     const hash = crypto.createHash('sha1').update(bytes).digest('hex');
     const cached = this.fontCache.get(hash);
     if (cached) return cached;
+    // **解析失败也要缓存**（按内容哈希）：不缓存的话每轮都要重新解析一遍。
+    const failed = this.fontAnalysisFailure(hash);
+    if (failed) throw new Error(failed);
 
-    const font = opentype.parse(
-      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-    );
+    let font;
+    try {
+      font = opentype.parse(
+        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      );
+    } catch (error) {
+      this.rememberFontAnalysisFailure(hash, String(error && error.message ? error.message : error));
+      throw error;
+    }
     const baseFamily = readBaseFamily(font);
     const ref = this.dbPath
       ? { key: 'fixed', file: this.dbPath, label: '指定参考库' }
@@ -414,13 +450,37 @@ class GlyphEngine {
     }
 
     let entries;
+    // **先看"这个字体解析不出来"的负缓存**：连下载都省掉。
+    //
+    // 站点的图标字体 URL 常常返回 HTML 错误页（实测学习通 icomoon.ttf
+    // 返回 529 字节 HTML）—— 那种下载是"成功"的，
+    // "下载失败负缓存"抓不到 → 每轮白下载一次（实测 130~160ms）。
+    if (font.kind === 'url') {
+      const hit = this.fontAnalysisFailure(font.value);
+      if (hit) {
+        reason = 'font-analyze-failed: ' + hit;
+        this.scopes.set(scopeKey, { mapping, unresolved: limited.length });
+        return { scopeKey, obfuscated: false, mapping, unresolved: limited.length, reason };
+      }
+    }
+    let bytes;
     try {
-      const bytes = await this.fetchFont(font);
+      bytes = await this.fetchFont(font);
       if (!bytes) throw new Error('字体来源为空');
-      entries = this.analyzeFont(bytes);
     } catch (error) {
       const cause = error && error.cause ? ` (${error.cause.code || ''} ${error.cause.message || ''})` : '';
       reason = 'font-fetch-failed: ' + String(error && error.message ? error.message : error) + cause;
+      this.scopes.set(scopeKey, { mapping, unresolved: limited.length });
+      return { scopeKey, obfuscated: false, mapping, unresolved: limited.length, reason };
+    }
+    try {
+      entries = this.analyzeFont(bytes);
+    } catch (error) {
+      // 解析失败也要记负缓存：否则每轮都重新下载 + 重新解析一遍（白花时间）。
+      if (font.kind === 'url') {
+        this.rememberFontAnalysisFailure(font.value, String(error && error.message ? error.message : error));
+      }
+      reason = 'font-analyze-failed: ' + String(error && error.message ? error.message : error);
       this.scopes.set(scopeKey, { mapping, unresolved: limited.length });
       return { scopeKey, obfuscated: false, mapping, unresolved: limited.length, reason };
     }

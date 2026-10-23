@@ -75,6 +75,8 @@ class InjectorCoordinator {
     this.loggedReasons = new Set();
     /** 带混淆字体的标签（key -> {tabIndex, windowIndex, url}），走快轮询 */
     this.cipherTabs = new Map();
+    /** 已经喊过"重报"的标签（每个标签只喊一次）：key = 标签标识 */
+    this.resyncedTabs = new Set();
     /** 快轮询的定时器 */
     this.fastTimer = null;
     this.fastRunning = false;
@@ -252,9 +254,40 @@ class InjectorCoordinator {
     }
   }
 
+  /**
+   * 这个标签是不是**第一次**被处理？第一次的话要喊一声"重报"。
+   *
+   * 守卫"App 已经送达到就不上报"这条规则是按**页面里的账本**算的，
+   * 而 App 是另一个进程：App 重启后自己手里是空的，
+   * 页面却还留着上一任 App 下发的映射 → 守卫以为"不用报" →
+   * App 永远学不到这个作用域 → 也就不会登记这个标签 →
+   * **快通道根本不盯它** → 换题后只能等主通道那一圈（~1.2 秒）→
+   * 用户"换题立刻复制"就复制出密文（2026-10-23 真机故障：第 1 次成功、第 2 次失败）。
+   *
+   * 每个标签只喊一次：喊完之后页面会把作用域重新报上来，
+   * App 学到之后照常下发映射，之后就是正常节奏。
+   *
+   * 喊的动作是**零额外成本**的：它搭在 pollState 那次 Apple Event 里，
+   * 不另外发一条。
+   */
+  claimResync(tabIndex, windowIndex = null) {
+    const key =
+      tabIndex === null || tabIndex === undefined
+        ? 'front'
+        : windowIndex
+          ? `w${windowIndex}t${tabIndex}`
+          : String(tabIndex);
+    if (this.resyncedTabs.has(key)) return false;
+    this.resyncedTabs.add(key);
+    return true;
+  }
+
   /** 处理一个标签：轮询状态 → 必要时注入 → 消费待处理队列并下发映射 */
   async processTab(tabIndex, windowIndex = null, jobKey = null) {
-    const state = await this.bridge.pollState({ tabIndex, windowIndex });
+    // **第一次**处理这个标签时喊一声"重报"（见 claimResync 的说明）：
+    // 让页面把已知作用域重新报一遍，App 才学得到 → 才会登记成快轮询标签。
+    const resync = this.claimResync(tabIndex, windowIndex);
+    const state = await this.bridge.pollState({ tabIndex, windowIndex, resync });
     if (process.env.CR_DEBUG) {
       this.log('pollState => ' + JSON.stringify(state).slice(0, 260));
     }
@@ -338,19 +371,38 @@ class InjectorCoordinator {
             reasonText,
         );
         // 出现自定义字体 → 这个标签值得持续看住
-        if (group.font) {
+        //
+        // **只有真建出映射的才登记进快通道**：图标字体(icomoon 之类)建不出映射，
+        // 它们不会换题，不需要快反应 —— 让它们进来只是白花 Apple Event。
+        // (Tauri 侧同口径。)
+        if (group.font && Object.keys(result.mapping).length > 0) {
           this.watchTab(tabIndex, state.url, windowIndex);
           // 而且要**快轮询**：换题后新字体的映射必须尽快就绪，
           // 否则用户"切完题立刻复制"拿到的是原始密文。
           const ckey = jobKey || (tabIndex === null || tabIndex === undefined ? 'front' : `w${windowIndex || 1}t${tabIndex}`);
           this.cipherTabs.set(ckey, { tabIndex, windowIndex, url: state.url });
         }
-        const setResult = await this.bridge.setMapping(group.scopeKey, result.mapping, { tabIndex, windowIndex });
-        if (process.env.CR_DEBUG) this.log('setMapping => ' + JSON.stringify(setResult));
-        if (!setResult || setResult === 'FAILED' || String(setResult).indexOf('NO-') === 0) {
-          this.state.lastError = '映射下发失败: ' + setResult;
+        // **只有真建出映射才 ack**（ack = "App 已经处理过这个作用域"，
+        // 页面收到 ack 就不再上报这个作用域）。
+        //
+        // 建不出映射时（字体取不到 / 分析失败 / 这个作用域本来就是普通字体）
+        // **不下发、也不 ack**：页面会继续上报 → 字体恢复后能自动补上。
+        // 取字体的失败有负缓存（冷却期内不重复请求），所以重试并不贵。
+        //
+        // Tauri 侧同口径（那边也是 mapping 为空就不下发）——
+        // 两边的页面协议必须一致，否则同一份页面在两个 App 上表现不同。
+        if (Object.keys(result.mapping).length === 0) {
+          if (process.env.CR_DEBUG) {
+            this.log('setMapping 跳过（没建出映射）: ' + group.scopeKey.slice(0, 60));
+          }
+        } else {
+          const setResult = await this.bridge.setMapping(group.scopeKey, result.mapping, { tabIndex, windowIndex });
+          if (process.env.CR_DEBUG) this.log('setMapping => ' + JSON.stringify(setResult));
+          if (!setResult || setResult === 'FAILED' || String(setResult).indexOf('NO-') === 0) {
+            this.state.lastError = '映射下发失败: ' + setResult;
+          }
+          mapped += 1;
         }
-        mapped += 1;
       }
     }
     return { action: mapped === 0 ? 'idle' : 'mapped', count: mapped };
