@@ -18,12 +18,19 @@ const { execFileSync } = require('child_process');
 //
 // 查找顺序：命令行参数 → 本地构建产物 → 已安装的 App。
 // （release/ 是构建产物、随时可重建，清理后不该让自检脚本直接报"找不到"。）
+//
+// ⚠️ **给了命令行参数就必须验那个包** —— 2026-10-23 差点栽在这儿:
+// 原来"参数不存在就静默回退到别的候选",于是传个错路径也会**验的是另一个包**
+// 并报"全部通过" ⇒ **假绿**。交付脚本正是靠这个脚本把关的,假绿等于没有门禁。
 const APP_CANDIDATES = [
   process.argv[2],
   path.join(__dirname, '..', '..', 'release', 'mac-arm64', '模拟输入.app'),
   '/Applications/模拟输入.app',
 ].filter(Boolean);
-const APP = APP_CANDIDATES.find((p) => fs.existsSync(path.join(p, 'Contents', 'Resources', 'app.asar'))) || path.resolve(APP_CANDIDATES[0]);
+const APP = process.argv[2]
+  ? path.resolve(process.argv[2])
+  : (APP_CANDIDATES.find((p) => fs.existsSync(path.join(p, 'Contents', 'Resources', 'app.asar')))
+    || path.resolve(APP_CANDIDATES[0]));
 const RESOURCES = path.join(APP, 'Contents', 'Resources');
 const ASAR = path.join(RESOURCES, 'app.asar');
 const UNPACKED = path.join(RESOURCES, 'app.asar.unpacked');
@@ -35,6 +42,13 @@ function check(name, ok, detail) {
 }
 
 console.log(`检查安装包: ${APP}\n`);
+
+// 明确指定的包必须真的存在 —— 不许悄悄换成别的包去验
+if (process.argv[2] && !fs.existsSync(ASAR)) {
+  console.error(`✖ 指定的包里没有 app.asar: ${ASAR}`);
+  console.error('  (给了路径就必须验那个包,不许回退去验别的 —— 否则是假绿)');
+  process.exit(1);
+}
 
 if (!fs.existsSync(ASAR)) {
   console.error('✖ 找不到 app.asar,先构建:');
