@@ -73,6 +73,38 @@ function extractAsar(asarPath, outDir) {
   execFileSync(cli, ['asar', 'extract', asarPath, outDir], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 }
 
+/**
+ * 相对 require 能不能在包里解析到。
+ *
+ * 依次试:原样 → 补 `.js` / `.cjs` / `.json` → 当目录找 `index.*`。
+ * 另外:解包到 `app.asar.unpacked` 的文件(原生模块)也算存在 ——
+ * asar 里只存占位,真文件在 unpacked 目录。
+ */
+function resolvesInside(fromFile, spec, root) {
+  const target = path.resolve(path.dirname(fromFile), spec);
+  const rel = path.relative(root, target);
+  const candidates = [
+    target,
+    target + '.js',
+    target + '.cjs',
+    target + '.json',
+    path.join(target, 'index.js'),
+    path.join(target, 'index.cjs'),
+    path.join(target, 'index.json'),
+  ];
+  if (rel && !rel.startsWith('..')) {
+    const unpacked = path.join(UNPACKED, rel);
+    candidates.push(unpacked, unpacked + '.js', path.join(unpacked, 'index.js'));
+  }
+  return candidates.some(c => {
+    try {
+      return fs.existsSync(c) && fs.statSync(c).isFile();
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
 // ③ Safari 修复运行时文件在 asar 里
 /**
  * 读 asar 里的文件清单。
@@ -131,6 +163,7 @@ check('asar 内不含零散 markdown', !asarList.some((f) => f.endsWith('.md') &
 } // ← asar 清单可读
 
 // ⑤ 把 asar 解出来真跑一遍引擎：路径写错、vendor 缺失都会在这里当场暴露
+// ⑥ 包内**所有相对 require 都必须能解析** —— 这是"装上就崩"的根因(见下)
 {
   const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cr-verify-'));
   try {
@@ -143,6 +176,46 @@ check('asar 内不含零散 markdown', !asarList.some((f) => f.endsWith('.md') &
     check('解包后引擎可加载且参考库可解析', true,
       `${db.header.count} 字 / 栅格 ${db.header.gridSize}`);
     check('解包后功能注册表可加载', typeof require(path.join(tmp, 'src/features/index.js')).loadFeatures === 'function');
+
+    // ⑥ 相对 require 的完整性
+    //
+    // ## 为什么必须有这一条
+    //
+    // 2026-10-23 出过一次事故:electron-builder 的 `files` 是**白名单**,
+    // 新加在仓库根目录的 `playback-guard.cjs` / `shortcut-latch.cjs`
+    // 没被写进白名单 ⇒ **没进包** ⇒ `main.js` 顶层 `require(...)` 直接抛
+    // ⇒ App **启动即崩**(弹「A JavaScript error occurred in the main process」)。
+    //
+    // 而当时的打包自检只看 Safari 引擎和 vendor 文件 ⇒ **CI 全绿、装上就是坏的**。
+    //
+    // ⇒ 这一条把"漏打包"这类问题**在打包那一刻**就拦下来。
+    const missing = [];
+    let scanned = 0;
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        const rel = path.relative(tmp, full);
+        // 第三方依赖自己会解析(可选依赖常常没被打进去),不扫
+        if (rel.split(path.sep)[0] === 'node_modules') continue;
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!/\.(js|cjs|mjs)$/.test(entry.name)) continue;
+        scanned += 1;
+        const src = fs.readFileSync(full, 'utf-8');
+        // 只认**字面量**的相对 require;计算路径(require(变量))静态查不了,跳过
+        const re = /require\(\s*['"](\.[^'"]+)['"]\s*\)/g;
+        let m;
+        while ((m = re.exec(src)) !== null) {
+          if (!resolvesInside(full, m[1], tmp)) {
+            missing.push(`${rel.split(path.sep).join('/')} → ${m[1]}`);
+          }
+        }
+      }
+    };
+    walk(tmp);
+    check('包内所有相对 require 都能解析(装上不崩)', missing.length === 0,
+      missing.length
+        ? `缺 ${missing.length} 个: ${missing.slice(0, 6).join(' ; ')}`
+        : `(扫了 ${scanned} 个文件)`);
   } catch (e) {
     check('解包后引擎可加载', false, e.message);
   } finally {

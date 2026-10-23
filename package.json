@@ -83,7 +83,8 @@
       "!packages/**/*",
       "!apps/**/*",
       "!tests/**/*",
-      "!**/*.md"
+      "!**/*.md",
+      "*.cjs"
     ],
     "afterPack": "electron/after-pack.cjs",
     "mac": {
