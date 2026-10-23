@@ -60,6 +60,13 @@ jobs:
       - name: UI regression test
         run: node --test tools/verify/verify-panel-transition.cjs tools/verify/verify-recording-ui.cjs
 
+      # 硬门禁:回放的两道安全闸(2026-10-23 T0 事故)。
+      # 回放的合成点击落点在自己窗口上 ⇒ 点到自己界面的「默认执行」⇒
+      # 无限自激循环 ⇒ 疯狂敲键盘 ⇒ 整台机器卡死(用户被迫强制关机)。
+      # 两道闸:重入保护(同一时刻最多一个回放)+ 落点在自己窗口上的点击不发出去。
+      - name: playback guard regression test
+        run: node --test tools/verify/verify-playback-guard.cjs
+
       - name: Build .app（native addon + electron-builder + afterPack sign）
         run: npm run dist:mac:arm64
 
