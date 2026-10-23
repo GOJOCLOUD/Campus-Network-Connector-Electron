@@ -508,25 +508,57 @@ function sleepMs(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// ── Playback safety(重入保护)──
+//
+// 2026-10-23 T0 事故:回放时发出的**合成点击**如果落在 App 自己的窗口上,
+// 就会点到自己界面上的「默认执行」→ 又一次回放 → 合成点击又点自己 →
+// **无限自激循环** → 疯狂敲键盘 → 整台机器卡死(用户被迫强制关机)。
+//
+// 这条分支只上**闸 ①(重入保护)**:同一时刻最多一个回放,后来的直接拒绝。
+// (闸 ②「落点在自己窗口上的点击不发出去」依赖坐标系,Windows 线暂不启用,
+//  理由见 `playback-guard.cjs` 的说明。)
+//
+// ⚠️ 这道闸不能去掉。少了它,一次误触就能把用户的机器搞死。
+const { createPlaybackGuard } = require('./playback-guard.cjs');
+const playbackGuard = createPlaybackGuard();
+
+// 闸的**入口检查**:起回放之前同步问一次,好让界面立刻知道"被拒绝了"。
+function playbackBusy() {
+  return playbackGuard.isBusy();
+}
+
 async function playClicks(clicks, interval, inputs) {
   const perClickInputs = Array.isArray(inputs)
     ? inputs.map(i => (i && String(i).trim()) ? String(i).trim() : null)
     : null;
 
-  for (let i = 0; i < clicks.length; i++) {
-    const c = clicks[i];
-    nativeCall('mouseClick', c.x, c.y);
-    await sleepMs(100);
-
-    if (perClickInputs && perClickInputs[i]) {
-      await sleepMs(100);
-      nativeCall('sendText', perClickInputs[i]);
-    }
-
-    if (i < clicks.length - 1) {
-      await sleepMs(Math.max(50, interval * 1000));
-    }
+  // 闸 ①:重入保护 —— 已经在放就直接拒绝,不并行起第二个回放。
+  if (!playbackGuard.tryStart()) {
+    console.error(`[playback] 上一次回放还没结束,这次没有重复执行(已拒绝 ${playbackGuard.rejectedCount()} 次)`);
+    return { executed: 0, skipped: 0, rejected: true };
   }
+  let executed = 0;
+  try {
+    for (let i = 0; i < clicks.length; i++) {
+      const c = clicks[i];
+      nativeCall('mouseClick', c.x, c.y);
+      executed += 1;
+      await sleepMs(100);
+
+      if (perClickInputs && perClickInputs[i]) {
+        await sleepMs(100);
+        nativeCall('sendText', perClickInputs[i]);
+      }
+
+      if (i < clicks.length - 1) {
+        await sleepMs(Math.max(50, interval * 1000));
+      }
+    }
+  } finally {
+    // 哪怕中途抛错,也要把闸放开,否则回放再也起不来。
+    playbackGuard.finish();
+  }
+  return { executed, skipped: 0, rejected: false };
 }
 
 async function pinyinType(text, delaySeconds = 3, autoSwitchIme = false) {
@@ -776,6 +808,9 @@ ipcMain.handle('file:readFile', async (_e, filename) => {
 // Playback (runs asynchronously)
 ipcMain.handle('play:playFile', async (_e, fileName, interval, inputText) => {
   try {
+    if (playbackBusy()) {
+      return { status: 'error', message: '上一次回放还没结束,这次没有重复执行' };
+    }
     const filePath = path.join(RECORDINGS_DIR(), fileName);
     if (!fs.existsSync(filePath)) return { status: 'error', message: '文件不存在' };
     const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
@@ -795,6 +830,9 @@ ipcMain.handle('play:playFile', async (_e, fileName, interval, inputText) => {
 
 ipcMain.handle('play:playData', async (_e, clicks, interval) => {
   try {
+    if (playbackBusy()) {
+      return { status: 'error', message: '上一次回放还没结束,这次没有重复执行' };
+    }
     playClicks(clicks || [], interval || 0.5, null).catch(e => console.error('[play] error:', e));
     return { status: 'success' };
   } catch (e) {

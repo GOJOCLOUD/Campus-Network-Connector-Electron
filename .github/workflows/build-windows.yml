@@ -35,6 +35,13 @@ jobs:
       - name: frame-bridge regression test
         run: node --test tools/verify/verify-frame-bridge.cjs
 
+      # 硬门禁:回放的**重入保护**(2026-10-23 T0 事故)。
+      # 回放的合成点击落点在自己窗口上 ⇒ 点到自己界面的「默认执行」⇒
+      # 无限自激循环 ⇒ 疯狂敲键盘 ⇒ 整台机器卡死(用户被迫强制关机)。
+      # 闸①(同一时刻最多一个回放)是纯逻辑、跨平台,Windows 线也必须有。
+      - name: playback guard regression test
+        run: node --test tools/verify/verify-playback-guard.cjs
+
       - name: Build native addon + renderer + NSIS installer
         run: npm run dist:win
 
