@@ -67,6 +67,14 @@ jobs:
       - name: playback guard regression test
         run: node --test tools/verify/verify-playback-guard.cjs
 
+      # 硬门禁:快捷键的 latch(触发许可)。
+      # 盯的是「触发之后 Ctrl+D 整个按键就不再会继续影响它了,
+      # 除非下一次重新按住 Ctrl」—— 触发一次就被消费掉,Control 不松开
+      # 就不许再触发。而「默认执行」的动作是**回放**,一次误触发就是
+      # 往用户屏幕上乱点一串合成点击 ⇒ 属于不能靠手测的那类闸。
+      - name: shortcut latch regression test
+        run: node --test tools/verify/verify-shortcut-latch.cjs
+
       - name: Build .app（native addon + electron-builder + afterPack sign）
         run: npm run dist:mac:arm64
 

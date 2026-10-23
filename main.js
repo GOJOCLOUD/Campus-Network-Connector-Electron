@@ -5,6 +5,8 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const nacl = require('tweetnacl');
+// 快捷键的 latch 状态机(纯函数,能单独测 —— 见 tools/verify/verify-shortcut-latch.cjs)
+const { createShortcutLatch } = require('./shortcut-latch.cjs');
 
 // ── Native addon（按平台加载）──
 // macOS   → mac-coregraphics（CoreGraphics：模拟点击 / 输入 / 输入源 / 录制）
@@ -1005,17 +1007,56 @@ async function triggerPinyinFromClipboard() {
 }
 
 function registerShortcuts() {
-  const ok1 = globalShortcut.register('Ctrl+Shift+A', () => {
-    triggerDefaultExecute().catch(e => console.error('[shortcut] default execute failed', e));
-  });
+  // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
+  //
+  // ## latch(2026-10-23 用户要求)
+  //
+  // > 「触发之后 Ctrl+D 整个按键就不再会继续影响它了,
+  // > 除非下一次重新按住 Ctrl,再点击相应的字母」
+  //
+  // `globalShortcut` **只在按下时回调**,不告诉你 Control 什么时候松开 ⇒
+  // 靠它自己解不开 latch(按住 Ctrl 连按会连着触发;而「默认执行」是回放,
+  // 连着触发就是往屏幕上乱点)。
+  // 所以另开一个**只读**监听(CGEventTap ListenOnly,**不需要辅助功能权限**)
+  // 看 Control 的按下/松开边沿:Control 一松开就重新武装。
+  //
+  // ## 规则(**Tauri 版同口径**;见本仓库 ADR-0013 / Tauri 仓库 ADR-0024)
+  //
+  // - 触发 ⇒ `armed = false` 且 `blocked = true`;
+  // - **Control 松开** ⇒ `blocked = false`、`armed = true`(彻底解锁);
+  // - Control 按下 ⇒ **只有 `blocked == false` 时**才武装。
+  //
+  // 最后一条是关键:系统热键的回调和只读监听的回调**谁先到不确定**。
+  // 如果「Control 按下」那一下能把 latch 解开,用户按住 Ctrl 连按就会连着
+  // 触发 —— 而「默认执行」是回放,触发多次就是往屏幕上乱点。
+  //
+  // ⚠️ Windows 线没有这个只读监听(那边没有这个原生模块)⇒ **那边没有 latch**,
+  //   维持原有行为。这是有意的平台差异,记在 ADR-0013。
+  //
+  // 状态机本身在 `shortcut-latch.cjs`(纯函数)—— 与 Tauri 版 `Latch` 同口径,
+  // 回归测试见 `tools/verify/verify-shortcut-latch.cjs`。
+  const latch = createShortcutLatch();
+  const watched = process.platform === 'darwin'
+    ? nativeCall('watchControlKey', (ctrlDown) => latch.onCtrlChange(ctrlDown))
+    : null;
+  const canLatch = watched === true;
+  if (process.platform === 'darwin' && !canLatch) {
+    console.warn('[shortcut] 拿不到 Control 按下/松开的只读监听 ⇒ latch 不可用(按住 Ctrl 连按会连着触发)');
+  }
+
+  const fire = (fn, name) => () => {
+    // 锁着 ⇒ 不触发(canLatch 为 false 时压根不碰 latch,维持旧行为)。
+    if (canLatch && !latch.tryFire()) return;
+    fn().catch(e => console.error(`[shortcut] ${name} failed`, e));
+  };
+
+  const ok1 = globalShortcut.register('Ctrl+S', fire(triggerDefaultExecute, 'default execute'));
   // 剪贴板直输走的是「输入源切换 + 拼音键入」这套 macOS 打法，
   // Windows 上没有等价物（那边靠 WM_CHAR 直接送字符），所以不注册这个快捷键。
   const ok2 = process.platform === 'darwin'
-    ? globalShortcut.register('Ctrl+Shift+D', () => {
-      triggerPinyinFromClipboard().catch(e => console.error('[shortcut] pinyin failed', e));
-    })
+    ? globalShortcut.register('Ctrl+D', fire(triggerPinyinFromClipboard, 'pinyin'))
     : null;
-  console.log(`[shortcut] Ctrl+Shift+A=${ok1} Ctrl+Shift+D=${ok2}`);
+  console.log(`[shortcut] Ctrl+S=${ok1} Ctrl+D=${ok2} latch=${canLatch}`);
 }
 
 // ── App Lifecycle ──

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <mutex>
 #include <vector>
+#include <unistd.h>
 
 // ── Recording Globals ────────────────────────────────────────────────────
 // We use a polling approach instead of ThreadSafeFunction to avoid
@@ -63,6 +64,96 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
     }
 
     return event;
+}
+
+// ── 快捷键 latch:观察 Control 的按下/松开边沿 ─────────────────────
+//
+// ## 为什么需要它
+//
+// 用户的要求(2026-10-23):
+// > 「触发之后 Ctrl+D 整个按键就不再会继续影响它了,
+// > 除非下一次重新按住 Ctrl,再点击相应的字母」
+//
+// Electron 的 `globalShortcut` **只在按下时回调**,不告诉你 Control 什么时候
+// 松开 ⇒ latch 解不开(按住 Ctrl 连按会连着触发,而「默认执行」是回放,
+// 连着触发就是往屏幕上乱点)。
+//
+// 这里用一个**会话级 ListenOnly** 的键盘 tap 观察 Control 的边沿:
+// - **ListenOnly 不需要「辅助功能」权限**(会话级只读监听是例外)
+//   —— Electron ad-hoc 签名也能用(和 globalShortcut 一样不需要权限);
+// - 也**不需要** active tap 那种"能吞键"的能力 —— 吞键交给系统热键做。
+static std::atomic<bool> g_controlDown{false};
+static std::atomic<bool> g_controlWatchRunning{false};
+static std::atomic<bool> g_controlTapReady{false};
+static std::mutex g_controlTsfnMutex;
+static Napi::ThreadSafeFunction g_controlTsfn = nullptr;
+
+static CGEventRef controlTapCallback(CGEventTapProxy, CGEventType type,
+                                      CGEventRef event, void*) {
+    if (type == kCGEventTapDisabledByTimeout ||
+        type == kCGEventTapDisabledByUserInput) {
+        g_controlWatchRunning = false;
+        return nullptr;
+    }
+    if (type == kCGEventFlagsChanged) {
+        bool ctrlDown = (CGEventGetFlags(event) & kCGEventFlagMaskControl) != 0;
+        bool before = g_controlDown.load();
+        if (ctrlDown != before) {
+            g_controlDown.store(ctrlDown);
+            Napi::ThreadSafeFunction tsfn = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_controlTsfnMutex);
+                tsfn = g_controlTsfn;
+            }
+            if (tsfn) {
+                // NonBlocking:别在 tap 线程上等 JS —— tap 回调一慢,
+                // 系统会直接把这个 tap 关掉(监听就没了)。
+                //
+                // ⚠️ node-addon-api 的 `NonBlockingCall` 只有两个重载:
+                //   · `NonBlockingCall(callback)` —— callback 是
+                //     `void(Env, Function)`,**按值捕获**即可;
+                //   · `NonBlockingCall(DataType* data, callback)` —— data 是**指针**。
+                // 这里用第一个重载,把 `ctrlDown` **按值捕获**进 lambda:
+                // 不需要在堆上分配、也不会有生命周期问题。
+                tsfn.NonBlockingCall([ctrlDown](Napi::Env env, Napi::Function cb) {
+                    cb.Call({Napi::Boolean::New(env, ctrlDown)});
+                });
+            }
+        }
+    }
+    return event;
+}
+
+static void controlWatchThreadFunc() {
+    CFMachPortRef tap = CGEventTapCreate(
+        kCGSessionEventTap,
+        kCGHeadInsertEventTap,
+        kCGEventTapOptionListenOnly,
+        CGEventMaskBit(kCGEventFlagsChanged),
+        controlTapCallback,
+        nullptr);
+
+    if (!tap) {
+        g_controlTapReady = false;
+        g_controlWatchRunning = false;
+        return;
+    }
+
+    auto rls = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+    CFRunLoopRef rl = CFRunLoopGetCurrent();
+    CFRunLoopAddSource(rl, rls, kCFRunLoopCommonModes);
+    CGEventTapEnable(tap, true);
+    g_controlTapReady = true;
+
+    while (g_controlWatchRunning.load()) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.2, false);
+    }
+
+    CFRunLoopRemoveSource(rl, rls, kCFRunLoopCommonModes);
+    CFMachPortInvalidate(tap);
+    CFRelease(tap);
+    CFRelease(rls);
+    g_controlTapReady = false;
 }
 
 // ── Recording Thread ────────────────────────────────────────────────────
@@ -474,6 +565,40 @@ Napi::Value DiagnoseExclusion(const Napi::CallbackInfo& info) {
 
 // ── Init ────────────────────────────────────────────────────────────────
 
+// ── 快捷键 latch:观察 Control 的按下/松开 ──────────────────────────
+//
+// 回调参数:一个 JS 函数,收到 `true` = Control 按下、`false` = Control 松开。
+//
+// 返回 `true` = 只读监听起来了(latch 可用);
+// 返回 `false` = **没起来**(比如系统不让建 tap)⇒ 调用方要降级
+// (没法做 latch,只能维持"按住 Ctrl 连按会连着触发"的旧行为)。
+Napi::Value WatchControlKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "watchControlKey 需要一个回调函数")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_controlTsfnMutex);
+        g_controlTsfn = Napi::ThreadSafeFunction::New(
+            env, info[0].As<Napi::Function>(), "control-watch", 0, 1);
+        // Unref:别让它挡住 Electron 事件循环退出
+        g_controlTsfn.Unref(env);
+    }
+    if (!g_controlWatchRunning.load()) {
+        g_controlTapReady = false;
+        g_controlWatchRunning = true;
+        std::thread(controlWatchThreadFunc).detach();
+    }
+    // 等 tap 建好(最多 300ms)—— 建不起来就**如实**告诉调用方,
+    // 别让它以为 latch 生效了。
+    for (int i = 0; i < 30 && !g_controlTapReady.load(); i++) {
+        usleep(10000);
+    }
+    return Napi::Boolean::New(env, g_controlTapReady.load());
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("mouseClick",
         Napi::Function::New(env, MouseClick));
@@ -505,6 +630,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
         Napi::Function::New(env, GetCurrentInputSource));
     exports.Set("selectInputSource",
         Napi::Function::New(env, SelectInputSource));
+    exports.Set("watchControlKey",
+        Napi::Function::New(env, WatchControlKey));
     return exports;
 }
 
