@@ -41,6 +41,21 @@ const FORCE_INJECT_EVERY = 5;
  */
 const CIPHER_TAB_POLL_MS = 200;
 
+/**
+ * 「看住的标签」和「已喊过重报」这两张表**统一的键**。
+ *
+ * 之前有三套写法并存：'front' / `w{windowIndex}t{tabIndex}` / String(index)，
+ * 而读表的时候用的是**裸数字**的 tabIndex → 永远取不到 →
+ * 计数永远不累加 → **强制重注入从不发生** →
+ * 页面里旧版守卫也就永远换不掉（守卫自己会按版本号就地升级，但没人重新注入它）。
+ *
+ * 键必须只有一种写法，否则「记下来的」和「取出来的」不是同一把钥匙。
+ */
+function tabKey(tabIndex, windowIndex = null) {
+  if (tabIndex === null || tabIndex === undefined) return 'front';
+  return windowIndex ? `w${windowIndex}t${tabIndex}` : String(tabIndex);
+}
+
 class InjectorCoordinator {
   constructor({ log, intervalMs, guardPath, dbPath, targetTabIndex = null, onWatch = null, siteFilter = [] } = {}) {
     this.log = log || (() => {});
@@ -51,6 +66,20 @@ class InjectorCoordinator {
       guardPath || paths.vendor('page-guard.js'),
       'utf8',
     );
+    /**
+     * 我们要注入的这份守卫是**第几版**。
+     *
+     * 页面里可能留着**上一任 App 注入的旧版守卫** —— 守卫自己会按版本号就地升级，
+     * 但前提是**有人重新注入它**。Electron 侧以前只在"守卫不在"时注入，
+     * 于是旧版守卫能一直赖着（2026-10-23 的偏差：ticksSinceInject 的计数从来没生效，
+     * 强制重注入从不发生）。现在两个口子都堵上：
+     * ① 版本对不上 → 立刻重注入；② 看住的标签每 FORCE_INJECT_EVERY 轮也重注入一次。
+     *
+     * 版本号从注入源里读（打包后是 `var GUARD_VERSION = 10;`）；
+     * 读不到就退化成"只靠周期性重注入"，不猜。
+     */
+    const versionMatch = /GUARD_VERSION\s*=\s*(\d+)/.exec(this.guardSource);
+    this.guardVersion = versionMatch ? Number(versionMatch[1]) : null;
     const frameBridgePath = paths.vendor('frame-bridge.js');
     this.frameBridgeSource = existsSync(frameBridgePath)
       ? fs.readFileSync(frameBridgePath, 'utf8')
@@ -148,12 +177,7 @@ class InjectorCoordinator {
 
   /** 登记一个"出现过混淆字体"的标签，之后持续看住它 */
   watchTab(tabIndex, url, windowIndex = null) {
-    const key =
-      tabIndex === null || tabIndex === undefined
-        ? 'front'
-        : windowIndex
-          ? `w${windowIndex}t${tabIndex}`
-          : String(tabIndex);
+    const key = tabKey(tabIndex, windowIndex);
     const existing = this.watched.get(key);
     if (existing && existing.url === url) return;
     this.watched.set(key, { url: url || '', ticksSinceInject: 0, tabIndex, windowIndex });
@@ -182,7 +206,7 @@ class InjectorCoordinator {
       if (!url) continue;
       const index = await this.bridge.findTabByUrl(url);
       if (index > 0) {
-        this.watched.set(String(index), { url, ticksSinceInject: 0, tabIndex: index, windowIndex: null });
+        this.watched.set(tabKey(index, null), { url, ticksSinceInject: 0, tabIndex: index, windowIndex: null });
       }
     }
     this.state.watchedTabs = this.watched.size;
@@ -271,12 +295,7 @@ class InjectorCoordinator {
    * 不另外发一条。
    */
   claimResync(tabIndex, windowIndex = null) {
-    const key =
-      tabIndex === null || tabIndex === undefined
-        ? 'front'
-        : windowIndex
-          ? `w${windowIndex}t${tabIndex}`
-          : String(tabIndex);
+    const key = tabKey(tabIndex, windowIndex);
     if (this.resyncedTabs.has(key)) return false;
     this.resyncedTabs.add(key);
     return true;
@@ -300,7 +319,10 @@ class InjectorCoordinator {
 
 
     // 标签可能被关掉/换位 → 用 URL 校验
-    const watchKey = tabIndex === null || tabIndex === undefined ? 'front' : tabIndex;
+    // **键必须和 watchTab 存进去时完全一致**（见 tabKey 的说明）：
+    // 之前这里用的是裸数字 tabIndex，而存进去的是 `w{w}t{t}` / String(index)
+    // → 永远取不到 → 计数永远不累加 → 强制重注入从不发生。
+    const watchKey = tabKey(tabIndex, windowIndex);
     const watchInfo = this.watched.get(watchKey);
     if (watchInfo && state.url && watchInfo.url && state.url !== watchInfo.url) {
       this.watched.delete(watchKey);
@@ -308,10 +330,14 @@ class InjectorCoordinator {
     }
 
     // 守卫不在 → 注入（顶层 + 递归所有同源 frame）
+    // **版本对不上也算"不在"**：页面里留着旧版守卫时，它不会自己升级
+    // （守卫能就地升级，但得有人重新注入它）。
+    const guardStale =
+      !!state.guard && this.guardVersion !== null && state.guardVersion !== this.guardVersion;
     const tabState = watchInfo || { ticksSinceInject: 0 };
     tabState.ticksSinceInject = (tabState.ticksSinceInject || 0) + 1;
     const forceInject = tabState.ticksSinceInject >= FORCE_INJECT_EVERY;
-    if (!state.guard || forceInject) {
+    if (!state.guard || guardStale || forceInject) {
       tabState.ticksSinceInject = 0;
       try {
         await this.bridge.injectGuard(this.guardSource, {
@@ -321,6 +347,11 @@ class InjectorCoordinator {
         });
         this.state.injections += 1;
         this.state.injected = true;
+        if (guardStale) {
+          this.log(
+            `页面里的守卫是第 ${state.guardVersion} 版，重新注入第 ${this.guardVersion} 版`,
+          );
+        }
         if (tabIndex === this.targetTabIndex) {
           this.log('已向当前标签页注入页面守卫（含所有同源 frame）');
         }

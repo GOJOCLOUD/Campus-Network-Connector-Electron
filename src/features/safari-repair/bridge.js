@@ -154,6 +154,7 @@ class SafariBridge {
       var g = window.__copyRepairGuard;
       var out = {
         guard: !!g,
+        guardVersion: g ? (g.version || 0) : 0,
         pending: null,
         collect: 'none',
         frames: [],
