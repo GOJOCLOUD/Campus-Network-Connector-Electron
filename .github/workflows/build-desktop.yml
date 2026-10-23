@@ -35,6 +35,17 @@ jobs:
       - name: frame-bridge regression test
         run: node --test tools/verify/verify-frame-bridge.cjs
 
+      # 硬门禁:页面守卫的回归测试(跑不过就不发包)。
+      # 盯的是"换题之后新作用域会不会被发现、映射会不会真的到页面上":
+      # 2026-10-23 末那次真机故障(换题后第 1 次复制成功、第 2 次复制出密文)
+      # 就是守卫的三处根因,详见 ADR-0017。
+      # 这套用例要读 vendor/page-guard.js(Electron 侧不入库、由 tools/build-vendor.mjs
+      # 构建),所以先重建产物,测的才是**真正注入网页的那份**。
+      - name: page-guard regression test
+        run: |
+          npm run build:vendor
+          node --test tools/verify/verify-page-guard.cjs
+
       - name: Build .app（native addon + electron-builder + afterPack sign）
         run: npm run dist:mac:arm64
 
