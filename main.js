@@ -539,6 +539,29 @@ function pointInOwnWindow(x, y) {
   return pointInRect(ownWindowBounds(), x, y);
 }
 
+// 回放期间让窗口**穿透**(不接收鼠标事件),返回有没有成功。
+//
+// ## 为什么必须有它
+//
+// App 的窗口是 always-on-top 的小面板,**常常正好盖在目标网站的输入框上面**。
+// 回放要点击的位置如果落在自己窗口上:
+// - 不穿透 ⇒ 那个点击变成**点自己** ⇒ 点中自己的「默认执行」⇒ 又一次回放
+//   ⇒ **无限自激循环**(2026-10-23 T0)⇒ 疯狂键入 ⇒ 机器卡死;
+// - 而"跳过落在自己窗口上的点击"也不行 ⇒ 那些点击往往**正是要点的输入框**,
+//   跳过了回放就点不进去(功能缺失)。
+//
+// 穿透成功 ⇒ 点击**正常落到下面的应用** ⇒ 既不自激,回放也完整。
+// 穿透失败 ⇒ 退回"跳过落在自己窗口上的点击"(兜底)。
+function setWindowPassthrough(ignore) {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    mainWindow.setIgnoreMouseEvents(ignore, { forward: true });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // 闸 ① 的**入口检查**:起回放之前同步问一次。
 // 只检查、不计数 —— 计数由 playClicks 内部那一次负责(免得记两次)。
 function playbackBusy() {
@@ -555,13 +578,18 @@ async function playClicks(clicks, interval, inputs) {
     console.error(`[playback] 上一次回放还没结束,这次没有重复执行(已拒绝 ${playbackGuard.rejectedCount()} 次)`);
     return { executed: 0, skipped: 0, rejected: true };
   }
+  // **窗口穿透**:回放期间让窗口不接收鼠标事件,
+  // 这样回放的点击能落到下面的目标应用上(见 setWindowPassthrough 的说明)。
+  const penetrated = setWindowPassthrough(true);
   let executed = 0;
   let skipped = 0;
   try {
     for (let i = 0; i < clicks.length; i++) {
       const c = clicks[i];
-      // 闸 ②:落点在自己窗口上的点击**不发**(发出去就是点自己界面的按钮)。
-      if (pointInOwnWindow(c.x, c.y)) {
+      // 闸 ②:**只在穿透失败时才跳过**。
+      // 穿透了的话点击会正常落到下面的应用上(那才是回放要点的目标),
+      // 跳过反而会让回放少点几下 —— 而那些点击往往正是"点进输入框"的位置。
+      if (!penetrated && pointInOwnWindow(c.x, c.y)) {
         skipped += 1;
       } else {
         nativeCall('mouseClick', c.x, c.y);
@@ -579,6 +607,8 @@ async function playClicks(clicks, interval, inputs) {
       }
     }
   } finally {
+    // 窗口恢复可点 —— 不恢复的话,用户会以为界面坏了。
+    setWindowPassthrough(false);
     // 哪怕中途抛错,也要把闸放开,否则回放再也起不来。
     playbackGuard.finish();
   }
