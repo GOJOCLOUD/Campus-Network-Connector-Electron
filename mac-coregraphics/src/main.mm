@@ -26,6 +26,9 @@ static std::atomic<bool> g_startTime{false};
 static double g_recordingStartSecs = 0;
 static bool g_hasExclude = false;
 static CGRect g_excludeRect{};
+// 排除矩形会被主进程在窗口 move/resize 时刷新,而点击判定发生在监听线程上
+// → 读写要同步。单独一把锁,别跟点击列表那把混在一起(判定路径要短)。
+static std::mutex g_excludeMutex;
 static std::atomic<bool> g_tapFailed{false};
 
 // ── Event Tap Callback ───────────────────────────────────────────────────
@@ -42,8 +45,12 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
 
     if (type == kCGEventLeftMouseDown) {
         CGPoint loc = CGEventGetLocation(event);
-        if (g_hasExclude &&
-            CGRectContainsPoint(g_excludeRect, loc)) {
+        bool excluded = false;
+        {
+            std::lock_guard<std::mutex> lock(g_excludeMutex);
+            excluded = g_hasExclude && CGRectContainsPoint(g_excludeRect, loc);
+        }
+        if (excluded) {
             return event;
         }
 
@@ -119,27 +126,21 @@ Napi::Value MouseGetPosition(const Napi::CallbackInfo& info) {
     return obj;
 }
 
-Napi::Value StartRecording(const Napi::CallbackInfo& info) {
-    auto env = info.Env();
-    if (g_recording) {
-        Napi::Error::New(env, "already recording")
-            .ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    g_hasExclude = false;
-    if (info.Length() >= 1 && info[0].IsArray()) {
-        auto arr = info[0].As<Napi::Array>();
-        if (arr.Length() == 4) {
-            double l = arr.Get(0u).As<Napi::Number>().DoubleValue();
-            double t = arr.Get(1u).As<Napi::Number>().DoubleValue();
-            double r = arr.Get(2u).As<Napi::Number>().DoubleValue();
-            double b = arr.Get(3u).As<Napi::Number>().DoubleValue();
-            g_excludeRect = CGRectMake(l, t, r - l, b - t);
+// 开始/停止录制的核心(**不碰 N-API**)——
+// 正式流程和「自检」共用同一套,免得自检验的是另一条路径。
+//
+// `rect` = 排除矩形 [l, t, r, b](自身窗口的屏幕坐标范围);
+// 传空 = 不排除任何位置(自检的对照组用这个)。
+static bool recordingStart(const double* rect, int rectLen) {
+    if (g_recording) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_excludeMutex);
+        g_hasExclude = false;
+        if (rect && rectLen == 4) {
+            g_excludeRect = CGRectMake(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
             g_hasExclude = true;
         }
     }
-
     {
         std::lock_guard<std::mutex> lock(g_clickMutex);
         g_clicks.clear();
@@ -150,17 +151,44 @@ Napi::Value StartRecording(const Napi::CallbackInfo& info) {
 
     g_recordingThread = std::thread(recordingThreadFunc);
     g_recordingThread.detach();
-
-    return Napi::Boolean::New(env, true);
+    return true;
 }
 
-Napi::Value StopRecording(const Napi::CallbackInfo& info) {
+static void recordingStop() {
     if (g_recording) {
         g_recording = false;
     }
     if (g_runLoop) {
         CFRunLoopStop(g_runLoop);
     }
+}
+
+Napi::Value StartRecording(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    if (g_recording) {
+        Napi::Error::New(env, "already recording")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    double rect[4] = {0, 0, 0, 0};
+    int rectLen = 0;
+    if (info.Length() >= 1 && info[0].IsArray()) {
+        auto arr = info[0].As<Napi::Array>();
+        if (arr.Length() == 4) {
+            for (uint32_t i = 0; i < 4; i++) {
+                rect[i] = arr.Get(i).As<Napi::Number>().DoubleValue();
+            }
+            rectLen = 4;
+        }
+    }
+
+    recordingStart(rect, rectLen);
+    return Napi::Boolean::New(env, true);
+}
+
+Napi::Value StopRecording(const Napi::CallbackInfo& info) {
+    recordingStop();
     return Napi::Boolean::New(info.Env(), true);
 }
 
@@ -182,6 +210,52 @@ Napi::Value ClearRecordingClicks(const Napi::CallbackInfo& info) {
     std::lock_guard<std::mutex> lock(g_clickMutex);
     g_clicks.clear();
     return Napi::Boolean::New(info.Env(), true);
+}
+
+// 刷新「排除矩形」(自身窗口的屏幕坐标范围)。
+//
+// 落在这个矩形里的点击**不记** —— 点自己界面上的按钮(尤其「结束」)
+// 不该被当成一次外部点击。
+//
+// 主进程在窗口 move/resize 时调用它,所以矩形始终是当前的:
+// 开始录制时拍一张快照是不够的(窗口一动快照就过期了)。
+// 传 null / 少于 4 个数 = 不排除任何位置。
+Napi::Value SetExcludeRect(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    {
+        std::lock_guard<std::mutex> lock(g_excludeMutex);
+        g_hasExclude = false;
+        if (info.Length() >= 1 && info[0].IsArray()) {
+            auto arr = info[0].As<Napi::Array>();
+            if (arr.Length() == 4) {
+                double l = arr.Get(0u).As<Napi::Number>().DoubleValue();
+                double t = arr.Get(1u).As<Napi::Number>().DoubleValue();
+                double r = arr.Get(2u).As<Napi::Number>().DoubleValue();
+                double b = arr.Get(3u).As<Napi::Number>().DoubleValue();
+                g_excludeRect = CGRectMake(l, t, r - l, b - t);
+                g_hasExclude = true;
+            }
+        }
+    }
+    return Napi::Boolean::New(env, true);
+}
+
+// 删掉第 index 次点击(单条删除)。返回有没有删掉。
+Napi::Value RemoveRecordingClick(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        return Napi::Boolean::New(env, false);
+    }
+    int64_t index = info[0].As<Napi::Number>().Int64Value();
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_clickMutex);
+        if (index >= 0 && static_cast<size_t>(index) < g_clicks.size()) {
+            g_clicks.erase(g_clicks.begin() + static_cast<ptrdiff_t>(index));
+            removed = true;
+        }
+    }
+    return Napi::Boolean::New(env, removed);
 }
 
 Napi::Value IsRecording(const Napi::CallbackInfo& info) {
@@ -301,6 +375,103 @@ Napi::Value SelectInputSource(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, ok);
 }
 
+// 自检:「点自己界面上的按钮,会不会被记成一次点击」。
+//
+// 做的是一组**对照**,同一个位置、同一个合成点击,只换排除矩形:
+// ① 把排除矩形**关掉** → 这个点击**应该**被记下来
+//    (证明事件监听确实收到了合成点击;没收到 = 这次测不了,不是"通过");
+// ② 把排除矩形设成**传入的窗口范围** → 这个点击**不应该**被记下来。
+//
+// 参数:info[0] = [l, t, r, b](窗口范围),info[1] = [x, y](点击位置)。
+// 返回: { control, excluded, posted, conclusive }
+Napi::Value DiagnoseExclusion(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
+        return Napi::Boolean::New(env, false);
+    }
+    auto rectArr = info[0].As<Napi::Array>();
+    auto ptArr = info[1].As<Napi::Array>();
+    if (rectArr.Length() != 4 || ptArr.Length() != 2) {
+        return Napi::Boolean::New(env, false);
+    }
+    double winRect[4];
+    for (uint32_t i = 0; i < 4; i++) {
+        winRect[i] = rectArr.Get(i).As<Napi::Number>().DoubleValue();
+    }
+    CGPoint pt;
+    pt.x = ptArr.Get(0u).As<Napi::Number>().DoubleValue();
+    pt.y = ptArr.Get(1u).As<Napi::Number>().DoubleValue();
+
+    auto postClick = [&]() {
+        CGEventRef down = CGEventCreateMouseEvent(
+            nullptr, kCGEventLeftMouseDown, pt, kCGMouseButtonLeft);
+        CGEventRef up = CGEventCreateMouseEvent(
+            nullptr, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft);
+        if (!down || !up) {
+            if (down) CFRelease(down);
+            if (up) CFRelease(up);
+            return false;
+        }
+        CGEventPost(kCGHIDEventTap, down);
+        CGEventPost(kCGHIDEventTap, up);
+        CFRelease(down);
+        CFRelease(up);
+        return true;
+    };
+
+    auto countClicks = [&]() {
+        std::lock_guard<std::mutex> lock(g_clickMutex);
+        return (int)g_clicks.size();
+    };
+    auto clearClicks = [&]() {
+        std::lock_guard<std::mutex> lock(g_clickMutex);
+        g_clicks.clear();
+    };
+
+    // ① 对照组:不排除
+    {
+        std::lock_guard<std::mutex> lock(g_excludeMutex);
+        g_hasExclude = false;
+    }
+    recordingStart(nullptr, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    bool posted1 = postClick();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    int control = countClicks();
+    recordingStop();
+    clearClicks();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // ② 实验组:排除矩形 = 窗口范围
+    {
+        std::lock_guard<std::mutex> lock(g_excludeMutex);
+        g_excludeRect = CGRectMake(winRect[0], winRect[1],
+                                   winRect[2] - winRect[0], winRect[3] - winRect[1]);
+        g_hasExclude = true;
+    }
+    recordingStart(winRect, 4);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    bool posted2 = postClick();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    int excluded = countClicks();
+    recordingStop();
+    clearClicks();
+
+    Napi::Object out = Napi::Object::New(env);
+    out.Set("control", Napi::Number::New(env, control));
+    out.Set("excluded", Napi::Number::New(env, excluded));
+    out.Set("posted", Napi::Boolean::New(env, posted1 && posted2));
+    out.Set("conclusive", Napi::Boolean::New(env, control > 0));
+    Napi::Array rectOut = Napi::Array::New(env, 4);
+    for (uint32_t i = 0; i < 4; i++) rectOut.Set(i, Napi::Number::New(env, winRect[i]));
+    Napi::Array ptOut = Napi::Array::New(env, 2);
+    ptOut.Set(0u, Napi::Number::New(env, pt.x));
+    ptOut.Set(1u, Napi::Number::New(env, pt.y));
+    out.Set("rect", rectOut);
+    out.Set("point", ptOut);
+    return out;
+}
+
 // ── Init ────────────────────────────────────────────────────────────────
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -316,6 +487,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
         Napi::Function::New(env, GetRecordingClicks));
     exports.Set("clearRecordingClicks",
         Napi::Function::New(env, ClearRecordingClicks));
+    exports.Set("setExcludeRect",
+        Napi::Function::New(env, SetExcludeRect));
+    exports.Set("removeRecordingClick",
+        Napi::Function::New(env, RemoveRecordingClick));
+    exports.Set("diagnoseExclusion",
+        Napi::Function::New(env, DiagnoseExclusion));
     exports.Set("isRecording",
         Napi::Function::New(env, IsRecording));
     exports.Set("tapFailed",

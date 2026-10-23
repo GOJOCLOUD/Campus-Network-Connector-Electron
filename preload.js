@@ -33,10 +33,11 @@ contextBridge.exposeInMainWorld('cnc', {
   setCurrentAsInputSource(role) { return ipcRenderer.invoke('native:setCurrentAsInputSource', role); },
 
   // Recording
-  startRecording(excludeRect) { return ipcRenderer.invoke('native:startRecording', excludeRect); },
+  startRecording() { return ipcRenderer.invoke('native:startRecording'); },
   stopRecording() { return ipcRenderer.invoke('native:stopRecording'); },
   getRecordingClicks() { return ipcRenderer.invoke('native:getRecordingClicks'); },
   clearRecordingClicks() { return ipcRenderer.invoke('native:clearRecordingClicks'); },
+  removeRecordingClick(index) { return ipcRenderer.invoke('native:removeRecordingClick', index); },
   isRecording() { return ipcRenderer.invoke('native:isRecording'); },
   tapFailed() { return ipcRenderer.invoke('native:tapFailed'); },
 

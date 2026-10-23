@@ -46,6 +46,20 @@ jobs:
           npm run build:vendor
           node --test tools/verify/verify-page-guard.cjs
 
+      # 界面层的回归需要**构建出来的 dist/**(真正装进 App 的那份前端),
+      # 所以先单独构建一次 —— 下面的 dist:mac:arm64 里也会再构建一次,
+      # 重复的是那几十秒,换来的是"跑不过就不发包"这条门禁真的在打包**之前**。
+      - name: Build frontend
+        run: npm run build
+
+      # 硬门禁:界面层的回归(跑不过就不发包)。
+      # - 换页时内容区**底下**那条横向滚动条不许再出现
+      #   (用户反馈「下面有个滑条在滑动」),画面横滑的动画不许丢;
+      # - 录制的**单条删除**,以及「点自己界面上的按钮不算一次点击」的契约
+      #   (开始录制不再由前端传那张会过期的矩形)。
+      - name: UI regression test
+        run: node --test tools/verify/verify-panel-transition.cjs tools/verify/verify-recording-ui.cjs
+
       - name: Build .app（native addon + electron-builder + afterPack sign）
         run: npm run dist:mac:arm64
 

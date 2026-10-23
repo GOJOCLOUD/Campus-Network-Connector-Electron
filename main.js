@@ -687,9 +687,16 @@ ipcMain.handle('native:setCurrentAsInputSource', async (_e, role) => {
 });
 
 // Recording
-ipcMain.handle('native:startRecording', async (_e, excludeRect) => {
+ipcMain.handle('native:startRecording', async () => {
   try {
-    nativeCall('startRecording', excludeRect || [0, 0, 0, 0]);
+    // 排除矩形用**主进程**的窗口位置算(权威值),不采信渲染进程传过来的那份:
+    // 渲染进程那份是「开始录制那一刻」的快照,窗口一动就过期了。
+    let rect = null;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      const b = mainWindow.getBounds();
+      rect = [b.x, b.y, b.x + b.width, b.y + b.height];
+    }
+    nativeCall('startRecording', rect || []);
     return true;
   } catch (e) {
     return { error: e.message };
@@ -698,9 +705,11 @@ ipcMain.handle('native:startRecording', async (_e, excludeRect) => {
 
 ipcMain.handle('native:stopRecording', async () => {
   nativeCall('stopRecording', );
+  // **不清空**:录到的点击还要留着给「单条删除」用
+  // (界面上删一条,这里也得跟着删一条,两边才对得上)。
   const clicks = nativeCall('getRecordingClicks', );
-  nativeCall('clearRecordingClicks', );
-  return Array.isArray(clicks) ? clicks : [];
+  // null = 失败,界面据此保留原来的记录,不清空。
+  return Array.isArray(clicks) ? clicks : null;
 });
 
 ipcMain.handle('native:getRecordingClicks', async () => {
@@ -710,6 +719,11 @@ ipcMain.handle('native:getRecordingClicks', async () => {
 ipcMain.handle('native:clearRecordingClicks', async () => {
   nativeCall('clearRecordingClicks', );
   return true;
+});
+
+// 删掉第 index 次点击(单条删除)
+ipcMain.handle('native:removeRecordingClick', async (_e, index) => {
+  return nativeCall('removeRecordingClick', Number(index) || 0) === true;
 });
 
 ipcMain.handle('native:isRecording', async () => {
@@ -837,6 +851,21 @@ function createWindow() {
 
   mainWindow.setAlwaysOnTop(true, 'screen-saver');
 
+  // 录制用的「排除矩形」必须**跟着窗口走**。
+  //
+  // 「点自己界面上的按钮不算一次点击」靠它实现:落在自己窗口范围内的点击不记。
+  // 矩形不能只在开始录制时拍一张快照 —— 窗口一动快照就过期了,点「结束」
+  // 会被当成一次外部点击。所以窗口**每次移动/变高**都刷新一次。
+  //
+  // (Tauri 版同口径:窗口事件里刷新,见 tauri-app/src-tauri/src/lib.rs。)
+  const refreshExcludeRect = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const b = mainWindow.getBounds();
+    nativeCall('setExcludeRect', [b.x, b.y, b.x + b.width, b.y + b.height]);
+  };
+  mainWindow.on('move', refreshExcludeRect);
+  mainWindow.on('resize', refreshExcludeRect);
+
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
   });
@@ -904,7 +933,35 @@ app.on('ready', () => {
   registerShortcuts();
   startKeepalive();
   initFeatures();
+  runRecordingExclusionDiag();
 });
+
+// 启动参数带 `--diag-recording-exclusion` 时,跑一次
+// 「点自己界面上的按钮会不会被记成一次点击」的自检,
+// 结果写进 <userData>/diag-recording.json。
+//
+// 平时**不跑** —— 它会往自己窗口里发合成点击,
+// 不该在用户正常用的时候发生。要查这件事时再手动带这个参数启动。
+function runRecordingExclusionDiag() {
+  if (!process.argv.includes('--diag-recording-exclusion')) return;
+  setTimeout(() => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      const b = mainWindow.getBounds();
+      const rect = [b.x, b.y, b.x + b.width, b.y + b.height];
+      // 窗口左侧那条透明边距 —— 点这里没有任何副作用,又确实在窗口范围内
+      const point = [b.x + 4, b.y + 60];
+      const result = nativeCall('diagnoseExclusion', rect, point) ||
+        { error: '原生模块没有 diagnoseExclusion(平台不支持?)' };
+      const out = { ...result, rect, point, at: new Date().toISOString() };
+      const file = path.join(app.getPath('userData'), 'diag-recording.json');
+      fs.writeFileSync(file, JSON.stringify(out, null, 2));
+      console.log('[diag] 录制排除自检:', JSON.stringify(out));
+    } catch (e) {
+      console.error('[diag] 录制排除自检失败:', e && e.message);
+    }
+  }, 2500);
+}
 
 // ── Safari 复制修复 ──
 function initFeatures() {
