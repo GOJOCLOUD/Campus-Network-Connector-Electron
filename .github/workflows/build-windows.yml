@@ -27,6 +27,14 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      # 硬门禁:frame-bridge 的回归测试(跑不过就不发包)。
+      # 盯的是"站点换掉嵌套 iframe 之后,映射还能不能送到新那层"——
+      # 2026-10-23 真机故障就是这个:frame 名单过期 → 题目那层一份映射都收不到
+      # → 复制出来还是密文。测试直接从 TS 源码现场构建(不读 vendor/ 产物),
+      # 所以它测的永远是当前源码。
+      - name: frame-bridge regression test
+        run: node --test tools/verify/verify-frame-bridge.cjs
+
       - name: Build native addon + renderer + NSIS installer
         run: npm run dist:win
 
