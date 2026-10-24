@@ -21,9 +21,8 @@ export default function Stepper({
    * 用途:当**最后一步就是主操作界面**时 —— 再点一次「完成」会把整个面板收起,
    * 那一屏消失就没法操作了,所以那边把这个按钮去掉。
    *
-   * (Windows 线以前只有两步、最后一步正是主操作界面「默认执行」,所以那边传 true;
-   *  2026-10-24 补上「键盘输入」这一步之后,最后一步不再是主操作界面 ⇒ 传 false,
-   *  和 macOS 一致。)
+   * (2026-10-24:Windows 线补上「键盘输入」这一步之后,最后一步不再是主操作界面
+   *  ⇒ 两边都传 false,和 macOS 一致。)
    */
   hideCompleteButton = false,
   renderStepIndicator,

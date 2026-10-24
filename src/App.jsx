@@ -234,13 +234,13 @@ function App() {
     const onKeyDown = (e) => {
       // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
       // 只认 **Control**:不认 Win/Alt,也不要求 Shift(带 Shift 照样触发)——
-      // 与 mac 分支**逐字一致**(见 ADR-0013)。
+      // 两个平台**逐字一致**(见 ADR-0013)。
       //
       // ⚠️ ⌃D 这一条在 **Windows 上不走这里**:Windows 线的 ⌃D 由**主进程的全局
       //   快捷键**接管(main.js 的 registerShortcuts:读剪贴板 → `sendText` 逐字键入)。
       //   全局热键由系统吞掉按键,渲染进程**收不到** Ctrl+D 的 keydown
       //   ⇒ 不会两条路都触发(都触发 = 剪贴板内容被键入两遍)。
-      //   这里的 `!isWindows` 与 mac 分支保持一致 —— 别只改一边。
+      //   这里的 `!isWindows` 两个平台保持一致 —— 别只改一边。
       //
       //   (Windows 上「键盘输入」那一页是**手动**键入,和 ⌃D 的剪贴板直入
       //   不是一回事:那页是用户自己敲内容,⌃D 是把剪贴板直接敲进去。)
@@ -598,13 +598,15 @@ function App() {
     featureList,
     featureStatus,
     onToggleFeature: toggleFeature,
-    // 「辅助功能」授权状态:**Windows 没有这个概念**
-    // (Windows 的 `SendInput` 不需要辅助功能授权)⇒ 那边不显示这个小问号。
-    //
-    // 但要**显式**传 `showAccessibilityBadge={false}`,而不是"没传那个 prop" ——
-    // 这样两个平台的代码形状一致,以后加功能的人不会漏掉这一条。
-    showAccessibilityBadge: false,
-    accessibilityTrusted: null,
+    // 「辅助功能」授权状态:不做成占一整条的大横幅,只在第 4 页放一个小问号
+    // (红=还不能用,绿=可以用),点一下直接跳到系统设置。
+    // **只有 macOS 有「辅助功能」这回事**(Windows 的 SendInput 不需要授权),
+    // 所以 Windows 上这个小问号根本不出现,免得误报红色。
+    showAccessibilityBadge: isMac,
+    accessibilityTrusted: isMac
+      ? (nativeStatus ? nativeStatus.accessibilityTrusted === true : null)
+      : null,
+    onOpenAccessibilitySettings: () => cnc.openAccessibilitySettings?.(),
   }
 
   const renameDialogProps = {
