@@ -19,7 +19,8 @@ export default function KeyboardPanel({
 }) {
   // 「辅助功能」授权状态:一个小问号就够,不做成占一整条的大横幅。
   // 红=还不能用(模拟点击/回放/键入发不出去),绿=可以用,灰=状态未知。
-  // **Windows 没有「辅助功能」**(SendInput 不需要授权)→ 那边根本不显示这个小问号。
+  // **Windows 没有「辅助功能」**(SendInput 不需要授权)→ 那边根本不显示这个小问号
+  // (App.jsx 传的是 `showAccessibilityBadge: isMac`,Windows 上恒为 false)。
   const trusted = accessibilityTrusted === true
   const unknown = accessibilityTrusted === null || accessibilityTrusted === undefined
   const badgeClass = unknown
