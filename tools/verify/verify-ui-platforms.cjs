@@ -52,9 +52,18 @@ function serveDist() {
 function stub(platform, nativeStatus = null) {
   const status = nativeStatus || { ok: true, platform };
   return `(function () {
+    // 窗口动作的**调用记录**:用来断言右上角那三个按钮各自调了什么
+    // (特别是「关闭」必须调 hide 而不是 quit —— 那是「后台挂着」的关键)。
+    window.__winCalls = [];
+    // 键入请求的记录:用来断言「从剪贴板读入并键入」真把剪贴板的字送进去了。
+    window.__pinyinInputs = [];
     window.cnc = {
       platform: ${JSON.stringify(platform)},
-      quit() {}, minimize() {}, maximize() {},
+      quit() { window.__winCalls.push('quit'); },
+      minimize() { window.__winCalls.push('minimize'); },
+      maximize() { window.__winCalls.push('maximize'); },
+      hide() { window.__winCalls.push('hide'); },
+      clipboardReadText: async () => '来自剪贴板的文字',
       getFeatures: async () => [],
       getFeatureStatus: async () => null,
       setFeatureEnabled() {}, setFeatureEnabledSetting() {},
@@ -70,7 +79,10 @@ function stub(platform, nativeStatus = null) {
       renameFile: async () => ({ status: 'success' }),
       deleteFile: async () => ({ status: 'success' }),
       playFile: async () => ({ status: 'success' }),
-      pinyinInput: async () => ({ status: 'success' }),
+      pinyinInput: async (text, delay, autoSwitch) => {
+        window.__pinyinInputs.push([text, delay, autoSwitch]);
+        return { status: 'success' };
+      },
       startRecording: async () => true, stopRecording: async () => [],
       getRecordingClicks: async () => [], clearRecordingClicks: async () => true,
       settings: { setSelectedJson() {} },
@@ -192,6 +204,63 @@ async function probe(page) {
       await new Promise((r) => setTimeout(r, 500));
       check('Windows 第 2 步是「键盘输入」(拼音自动键入)',
         (await probe(page)).text.includes('键盘输入'));
+
+      // ── 右上角必须是**三个**按钮:最小化 / 最大化 / 关闭 ──
+      //
+      // 2026-10-24 用户口径:「把它右上角做一个三个按钮,就是最大化最小化
+      // 或者说直接关掉,别只留一个关掉的按钮」。
+      const corner = await page.evaluate(() => {
+        const host = [...document.querySelectorAll('.app-nodrag')].find((d) => {
+          const c = typeof d.className === 'string' ? d.className : '';
+          return c.includes('top-3') && c.includes('right-3');
+        });
+        if (!host) return null;
+        return [...host.querySelectorAll('button')].map((b) => ({
+          aria: b.getAttribute('aria-label') || '',
+          title: b.getAttribute('title') || '',
+        }));
+      });
+      check('Windows 右上角有 3 个按钮', corner && corner.length === 3,
+        corner ? corner.map((b) => b.aria).join(',') : '没找到右上角按钮组');
+      check('三个按钮是「最小化 / 最大化 / 关闭」',
+        corner && corner.map((b) => b.aria).join(',') === '最小化,最大化,关闭',
+        corner ? corner.map((b) => b.aria).join(',') : '');
+
+      // 点这三个按钮,看它们各自调的是哪个窗口动作。
+      //
+      // 关键一条:**「关闭」必须是 hide 而不是 quit** ——
+      // quit = 直接退进程(用户不接受:「他就直接完全退出了」),
+      // hide = 只把窗口藏起来,进程留着(「要在后台挂着,功能依然生效」)。
+      await page.evaluate(() => {
+        const host = [...document.querySelectorAll('.app-nodrag')].find((d) => {
+          const c = typeof d.className === 'string' ? d.className : '';
+          return c.includes('top-3') && c.includes('right-3');
+        });
+        [...host.querySelectorAll('button')].forEach((b) => b.click());
+      });
+      const calls = await page.evaluate(() => window.__winCalls);
+      check('三个按钮分别调 minimize / maximize / hide',
+        JSON.stringify(calls) === JSON.stringify(['minimize', 'maximize', 'hide']),
+        JSON.stringify(calls));
+      check('「关闭」不是退出(没有调 quit)',
+        !calls.includes('quit'), JSON.stringify(calls));
+
+      // ── 「从剪贴板读入并键入」:⌃D 全局键撤掉后,这个能力从这里进 ──
+      //
+      // 不只是"按钮在不在",还要**真能把剪贴板的字送进键入通道**。
+      const panelText = (await probe(page)).text;
+      check('「键盘输入」页有「从剪贴板读入并键入」按钮',
+        panelText.includes('从剪贴板读入并键入'));
+      await page.evaluate(() => {
+        const btn = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').includes('从剪贴板读入并键入'));
+        if (btn) btn.click();
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      const pasted = await page.evaluate(() => window.__pinyinInputs);
+      check('「从剪贴板读入并键入」真把剪贴板里的文字送进了键入通道',
+        pasted.some((p) => p[0] === '来自剪贴板的文字'), JSON.stringify(pasted));
+
       await page.close();
     }
 
@@ -213,6 +282,23 @@ async function probe(page) {
           && broken.text.includes('原生模块加载失败(测试桩)'),
       );
       await page.close();
+    }
+
+    // ── Windows 线**不注册任何全局快捷键**(源码级断言)──
+    //
+    // 2026-10-24 用户口径:⌃D 是 **Windows 的系统默认键** —— 我们抢过来,
+    // 用户在自己常用的软件里按 ⌃D,那个软件/系统对话框会**直接被关掉**
+    // (用户原话:「我不能设置为快捷键,不然他直接把软件退出了」)。⌃S 同理。
+    //
+    // 这条**只能在源码里查**:界面上看不出"系统里注册了哪些全局键"。
+    {
+      const mainJs = fs.readFileSync(path.join(__dirname, '..', '..', 'main.js'), 'utf8');
+      // 查的是**开关常量**,不是"调用点消失":注册那条路还在,被这个开关挡着。
+      // (同一个开关也管着 Control 轮询观察器 —— 它只服务于全局键的 latch。)
+      const switchOff = /GLOBAL_SHORTCUTS_ENABLED\s*=\s*false/.test(mainJs);
+      check('Electron 不注册任何全局快捷键(开关是关的)',
+        switchOff,
+        switchOff ? 'GLOBAL_SHORTCUTS_ENABLED = false' : '没找到 GLOBAL_SHORTCUTS_ENABLED = false');
     }
   } finally {
     await browser.close();

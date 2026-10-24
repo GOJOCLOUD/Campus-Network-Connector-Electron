@@ -9,6 +9,9 @@ contextBridge.exposeInMainWorld('cnc', {
   quit() { ipcRenderer.invoke('window:quit').catch(() => {}); },
   minimize() { ipcRenderer.invoke('window:minimize').catch(() => {}); },
   maximize() { ipcRenderer.invoke('window:maximize').catch(() => {}); },
+  // 关窗口但**进程留着**(Windows 线的「后台挂着」)。
+  // 唤回:托盘图标 / 再运行一次程序。彻底退出:托盘菜单的「退出程序」。
+  hide() { ipcRenderer.invoke('window:hide').catch(() => {}); },
 
   // Activation
   getActivationSnapshot() { return ipcRenderer.invoke('activation:getSnapshot'); },

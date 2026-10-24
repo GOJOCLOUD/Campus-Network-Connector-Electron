@@ -80,6 +80,12 @@
       "shortcut-latch.cjs"
     ],
     "afterPack": "electron/after-pack.cjs",
+    "extraResources": [
+      {
+        "from": "build/win-icon.ico",
+        "to": "win-icon.ico"
+      }
+    ],
     "win": {
       "icon": "build/win-icon.ico",
       "target": [

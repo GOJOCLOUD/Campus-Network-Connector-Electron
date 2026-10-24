@@ -129,6 +129,18 @@ if (asarList === null) {
   check('asar 内不含功能自测目录', !asarList.some((f) => f.startsWith('/src/features/') && f.includes('/test/')));
 }
 
+// ⑦ 托盘图标必须在 **asar 外面**。
+//
+// Windows 的托盘是**系统**画的(`Shell_NotifyIcon`),系统读不了 asar 里的文件
+// ⇒ 托盘图标必须用 `extraResources` 放到 `resources/` 下。
+// 少了它 ⇒ 装完之后托盘建不起来 ⇒ 用户点叉把窗口收起来之后
+// **就再也找不回窗口**(任务栏没有图标,也没有托盘)。
+{
+  const trayIcon = path.join(APP, 'resources', 'win-icon.ico');
+  check('托盘图标在包内(asar 外面:resources/win-icon.ico)', fs.existsSync(trayIcon),
+    fs.existsSync(trayIcon) ? '' : '少了它 ⇒ 装上后没有托盘图标');
+}
+
 /**
  * 把 asar 解到指定目录:优先用 @electron/asar 的 API,兜底走命令行。
  *

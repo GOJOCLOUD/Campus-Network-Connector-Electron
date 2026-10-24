@@ -1,11 +1,11 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, clipboard } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, clipboard, Tray, Menu } = require('electron');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const nacl = require('tweetnacl');
-// 快捷键的 latch 状态机(纯函数,能单独测 —— 见 tools/verify/verify-shortcut-latch.cjs)
+// 快捷键的 latch 状态机(纯函数,能单独测 —— 见 tools/verify/verify-shortcut-latch.cjs)。
 const { createShortcutLatch } = require('./shortcut-latch.cjs');
 
 // ── Native addon（按平台加载）──
@@ -92,11 +92,77 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      mainWindow.isMinimized() ? mainWindow.restore() : mainWindow.show();
-      mainWindow.focus();
-    }
+    // 第二次启动 = 把**已有的**窗口叫回来(而不是新开一份)。
+    // `restore()` 要在 `show()` 前面:窗口是最小化状态时,
+    // 光 show 不会把它从任务栏的最小化态里拉出来。
+    showMainWindow();
   });
+}
+
+// ── 托盘图标 ──
+//
+// **关窗口只是把窗口藏起来**(进程留着,见 `mainWindow.on('close')`),
+// 而 Windows 上窗口一藏,**任务栏就没有图标了** —— 没有托盘的话,
+// 这个 app 就**再也找不回来**(只剩"再运行一次程序"那条路)。
+//
+// 托盘菜单只有两项:
+// - 「显示窗口」:把藏起来的窗口叫回来(左键点托盘图标也是这个效果);
+// - 「退出程序」:**彻底退出**进程。
+//
+// 建不出来也不能拖垮整个 app:大不了没有托盘图标,
+// 用户还能靠"再运行一次程序"把窗口叫回来。
+let tray = null;
+/** 正在真正退出 —— 为 true 时不再拦窗口的 close(否则会把退出锁死) */
+let isQuitting = false;
+
+function showMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+/**
+ * 托盘图标的真实文件路径。
+ *
+ * **必须是真的文件路径**,不能是 asar 里的路径 ——
+ * Windows 的托盘是把图标交给系统画的(`Shell_NotifyIcon`),
+ * 系统读不了 asar(那是个归档包)。
+ * 所以打包时用 `extraResources` 把它放到 **asar 外面**
+ * (`resources/win-icon.ico`,见 package.json 的 build.extraResources),
+ * 运行时从 `process.resourcesPath` 取。
+ *
+ * 开发时(没打包)asar 不存在 ⇒ 退回仓库里的 `build/win-icon.ico`。
+ */
+function trayIconPath() {
+  const candidates = [
+    process.resourcesPath ? path.join(process.resourcesPath, 'win-icon.ico') : null,
+    path.join(__dirname, 'build', 'win-icon.ico'),
+  ].filter(Boolean);
+  return candidates.find((p) => {
+    try { return fs.existsSync(p); } catch (_) { return false; }
+  }) || null;
+}
+
+function createTray() {
+  try {
+    const iconPath = trayIconPath();
+    if (!iconPath) {
+      console.error('[tray] 找不到托盘图标,不装托盘(已试:', process.resourcesPath, '与', path.join(__dirname, 'build'), ')');
+      return;
+    }
+    tray = new Tray(iconPath);
+    tray.setToolTip('模拟输入');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: '显示窗口', click: () => showMainWindow() },
+      { label: '退出程序', click: () => { isQuitting = true; app.quit(); } },
+    ]));
+    // 左键点托盘图标 = 把窗口叫回来(用户点它就是想"看到窗口")。
+    tray.on('click', () => showMainWindow());
+    console.log('[tray] 托盘图标已创建:', iconPath);
+  } catch (error) {
+    console.error('[tray] 托盘图标创建失败(窗口照样能关,但没有托盘图标):', error);
+  }
 }
 
 // ── Settings ──
@@ -639,6 +705,12 @@ ipcMain.handle('window:maximize', () => {
   if (!mainWindow) return;
   mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
 });
+// 关窗口,但**进程留着**(Windows 线的「后台挂着」)。
+//
+// 和 macOS 的红绿灯同口径:窗口只是**藏起来**,进程还在跑,
+// 托盘图标也还在 ⇒ 还能把窗口叫回来。
+// 彻底退出走**托盘菜单里的「退出程序」**。
+ipcMain.handle('window:hide', () => { if (mainWindow) mainWindow.hide(); });
 
 // Settings (unchanged)
 ipcMain.on('settings:setSelectedJson', (_e, fileName) => {
@@ -715,16 +787,16 @@ ipcMain.handle('native:getStatus', async () => ({
   platform: process.platform,
   // 快捷键与 latch 的诊断字段(与 mac 分支的 `[shortcut]` 日志同口径)。
   //
-  // 排查「Windows 上快捷键没反应」时按这个顺序看:
-  // ① ctrlS / ctrlD —— 热键**注册**成功没有(被别的 App 抢走就是 false);
-  // ② latchAvailable / controlWatcherRunning —— Control 只读观察器在不在跑
-  //    (不在跑 ⇒ latch 根本解不开,按住 Ctrl 连按会连着触发);
-  // ③ latchArmed —— 当前是不是武装的(锁着就触发不了)。
+  // ⚠️ Windows 线**不注册任何全局快捷键**(2026-10-24 用户口径:⌃D 是 Windows 的
+  // 系统默认键,抢过来会让用户自己开的软件被直接关掉)⇒ 下面这一组字段
+  // 现在恒为 false / 不适用。`globalShortcutsEnabled: false` 就是用来
+  // 明确告诉排查的人:**这是按政策不注册,不是"注册失败"**。
   shortcutCtrlS: shortcutStatus.ctrlS,
   shortcutCtrlD: shortcutStatus.ctrlD,
   latchAvailable: shortcutStatus.latchAvailable,
   latchArmed: shortcutStatus.latchArmed,
   controlWatcherRunning: shortcutStatus.controlWatcherRunning,
+  globalShortcutsEnabled: false,
 }));
 
 ipcMain.handle('native:mouseClick', async (_e, x, y) => {
@@ -981,6 +1053,21 @@ function createWindow() {
     mainWindow.show();
   });
 
+  // **关窗口 ≠ 退出 App**(2026-10-24 用户口径:
+  // 「你不能点叉,他就直接完全退出了,这个他要在后台挂着,功能依然生效」)。
+  //
+  // Windows 上直接退进程 = 把 app **关掉了**(不是"收起来")。
+  // 这里改成**只隐藏窗口**:进程留着 ⇒ 托盘图标还在,还能把窗口叫回来。
+  // 彻底退出走**托盘菜单的「退出程序」**。
+  //
+  // macOS 保持原样(红绿灯关窗口,App 留在 Dock,`activate` 再开一个)。
+  mainWindow.on('close', (event) => {
+    if (isQuitting) return;                 // 正在退出 → 放行(别把退出锁死)
+    if (process.platform === 'darwin') return;
+    event.preventDefault();
+    mainWindow.hide();
+  });
+
   const indexPath = path.join(__dirname, 'dist', 'index.html');
   console.log(`[main] loading ${indexPath}`);
   mainWindow.loadFile(indexPath);
@@ -989,6 +1076,26 @@ function createWindow() {
 }
 
 // ── Shortcuts ──
+
+// Windows 线**要不要注册全局快捷键**。
+//
+// ## 关着(2026-10-24 用户口径)
+//!
+//! - **⌃D 是 Windows 的系统默认键**。抢过来 ⇒ 用户在自己常用的软件里按 ⌃D,
+//!   那个软件/系统对话框会**直接被关掉**
+//!   (用户原话:「我不能设置为快捷键,不然他直接把软件退出了」)。
+//! - **⌃S 同为系统默认键**(「保存」),而且它驱动的「默认执行(回放)」在 Windows 上
+//!   **已经没有界面了**(上一轮按用户口径撤掉:「本来就没有这个功能」)
+//!   ⇒ 留着它就是一个**没有入口的隐藏功能**。
+//!
+//! 所以 Windows 线:**系统里不注册、窗口内也不拦** —— ⌃S / ⌃D 就是普通按键。
+//! 「读剪贴板并键入」这个能力**没丢**:搬到了「键盘输入」页的按钮上。
+//!
+//! 写成一个常量(而不是干脆删掉那条注册的路)是为了:
+//! ① 意图一眼可见,不用去翻注册代码;
+//! ② 门禁(`tools/verify/verify-ui-platforms.cjs`)能直接守着它;
+//! ③ 将来真要加全局键时,改成 true 并把键加进注册列表就行。
+const GLOBAL_SHORTCUTS_ENABLED = false;
 
 // 快捷键与 latch 的**诊断状态**。
 //
@@ -1050,6 +1157,24 @@ async function triggerPinyinFromClipboard() {
 }
 
 function registerShortcuts() {
+  if (!GLOBAL_SHORTCUTS_ENABLED) {
+    // Windows 线**一个全局键都不占**(理由见 `GLOBAL_SHORTCUTS_ENABLED` 的注释)。
+    //
+    // 诊断字段(`shortcutCtrlS` / `shortcutCtrlD` / `latchAvailable` …)保留原样:
+    // 它们现在是"恒为 false / 不适用",配合 `native:getStatus` 里的
+    // `globalShortcutsEnabled: false` 能一眼看出是**按政策不注册**,
+    // 而不是「注册失败」。
+    shortcutStatus.ctrlS = false;
+    shortcutStatus.ctrlD = false;
+    shortcutStatus.latchAvailable = false;
+    shortcutStatus.latchArmed = false;
+    shortcutStatus.controlWatcherRunning = false;
+    console.log('[shortcut] Windows 线不注册任何全局快捷键(⌃D / ⌃S 是 Windows 的系统默认键)');
+    return;
+  }
+
+  // ── 下面这条是「真的要注册全局键」的路(当前开关是关的)──
+  //
   // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
   //
   // 与 mac 分支**同口径**(见本仓库 ADR-0013):
@@ -1129,6 +1254,8 @@ app.on('ready', () => {
   loadSettings();
   createWindow();
   registerShortcuts();
+  // Windows:装**托盘图标** —— 窗口被隐藏之后靠它叫回来 / 彻底退出。
+  if (process.platform === 'win32') createTray();
   startKeepalive();
   initFeatures();
 });
@@ -1166,10 +1293,19 @@ app.on('window-all-closed', () => {
   // 「Safari 复制修复」是**常驻能力**（要一直盯着浏览器、随时接管复制），
   // 如果关窗口就退出，等于用户随手一点就把功能关掉了 —— 实测会表现为
   // 「复制完全不修复」。Dock 图标还在，随时可以点回来开窗口。
-  if (process.platform !== 'darwin') app.quit();
+  //
+  // **Windows 线同口径**(2026-10-24 用户口径):关窗口只是把窗口**藏起来**,
+  // 进程留着(托盘图标还在)。这里**不退出** —— 真退出走托盘菜单的「退出程序」。
+  // (正常情况下这里根本不会触发:窗口的 close 被拦着,只是被 hide 了。
+  //  真的走到这里 = 窗口是真的全没了,那才允许退出。)
+  if (process.platform !== 'darwin') {
+    isQuitting = true;
+    app.quit();
+  }
 });
 
 app.on('before-quit', () => {
+  isQuitting = true;
   try { globalShortcut.unregisterAll(); } catch (_) {}
   stopKeepalive();
   try { features?.disposeAll(); } catch (_) {}
