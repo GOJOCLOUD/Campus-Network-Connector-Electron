@@ -11,42 +11,30 @@ function resolveBundleIdentifier(appPath) {
 }
 
 /**
- * 钥匙串里有没有**有效的**代码签名身份。
+ * 整包 ad-hoc 签名 —— **只为一件事:让签名有效**。
  *
- * ## 为什么不能用 ad-hoc(2026-10-24 定位)
+ * ## 为什么不追真证书
  *
- * ad-hoc 签名(`TeamIdentifier=not set`)拿不到**稳定的**系统授权身份:
- * 用户在「系统设置 → 隐私与安全性 → 辅助功能」里勾选这个 App 之后,
- * **每次重新构建、重新签名,身份都会变** ⇒ 授权留不住 ⇒
- * 发合成点击/按键(`CGEventPost`)被系统静默丢弃 ⇒
- * 「默认执行」(回放)、键入文本、录制**全都没功能**。
+ * 曾经这里是「优先用钥匙串里的真证书签」,理由是「ad-hoc 签名的身份跟着二进制变
+ * ⇒ 之前授过的「辅助功能」授权留不住」。
+ * **那个理由已作废**(2026-10-24 用户口径):重新安装需要重新授权是**正常代价**,
+ * 不值得为它维护任何额外机制 —— 不追证书、不追授权状态、
+ * 也不写「以后更新包不会再掉」这种承诺。重新勾一次就是了。
  *
- * 与 Tauri 版的 `tools/install-macos-app.sh` **同口径**:能用真证书就用真证书
- * (本机用的是 Apple Development: 8618291894921)。
+ * ## 那为什么还要签
  *
- * CI 上没有证书 ⇒ 返回 null ⇒ 退回 ad-hoc(分发场景的限制,见项目记忆.md)。
+ * 只为一个目的:**签名必须有效**。
+ * 没经过整包签名的 app,`codesign --verify` 会报
+ * 「code has no resources but signature indicates they must be present」——
+ * 那是**无效签名**,Gatekeeper 判成「应用已损坏」,比「无法验证开发者」更难绕过。
+ * ad-hoc 整包签名足够让 Gatekeeper 走「无法验证开发者 → 右键打开」那条可绕过的路。
  */
-function resolveSigningIdentity() {
-  try {
-    const out = execFileSync(
-      'security',
-      ['find-identity', '-v', '-p', 'codesigning'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
-    );
-    // 行长这样:  1) BE837299...168B65FD "Apple Development: 8618291894921 (FY2K6ZB64V)"
-    const m = out.match(/^\s*\d+\) [0-9A-F]{40} "([^"]+)"/m);
-    return m ? m[1] : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function signApp(appPath, bundleId, identity) {
-  const args = ['--force', '--deep'];
-  args.push('--sign', identity || '-');
-  args.push('--identifier', bundleId);
-  args.push(appPath);
-  execFileSync('codesign', args, { stdio: 'inherit' });
+function signApp(appPath, bundleId) {
+  execFileSync(
+    'codesign',
+    ['--force', '--deep', '--sign', '-', '--identifier', bundleId, appPath],
+    { stdio: 'inherit' }
+  );
 }
 
 exports.default = async function afterPack(context) {
@@ -59,30 +47,13 @@ exports.default = async function afterPack(context) {
   const appPath = path.join(appOutDir, `${productName}.app`);
   const bundleId = resolveBundleIdentifier(appPath);
 
-  // 优先用**真证书**签(授权能长期留着);签不了再退回 ad-hoc。
-  const identity = resolveSigningIdentity();
   try {
-    signApp(appPath, bundleId, identity);
-    console.log(
-      identity
-        ? `[afterPack] signed ${appPath} with ${identity} (${bundleId})`
-        : `[afterPack] ad-hoc signed ${appPath} (${bundleId}) —— 钥匙串里没有可用签名身份`
-    );
+    signApp(appPath, bundleId);
+    console.log(`[afterPack] ad-hoc 整包签名完成 ${appPath} (${bundleId})`);
   } catch (e) {
-    if (!identity) {
-      console.error('[afterPack] ad-hoc 签名失败:', e.message);
-      return;
-    }
-    // 真证书签不过 ⇒ 退一步,别把包打成"签名坏了"的状态。
-    console.error('[afterPack] 用', identity, '签名失败,退回 ad-hoc:', e.message);
-    try {
-      signApp(appPath, bundleId, null);
-      console.log(`[afterPack] ad-hoc signed ${appPath} (${bundleId})`);
-    } catch (e2) {
-      console.error('[afterPack] ad-hoc 签名也失败:', e2.message);
-    }
+    // 签不了就照实说 —— 别把「签坏了」的包当成好的发出去。
+    console.error('[afterPack] 签名失败:', e.message);
   }
 };
 
 exports.resolveBundleIdentifier = resolveBundleIdentifier;
-exports.resolveSigningIdentity = resolveSigningIdentity;

@@ -83,14 +83,18 @@ Control 按下        ⇒ 只有 blocked == false 时才 armed = true
 观察 Control 的**按下/松开边沿**,喂给 latch 状态机。
 
 - **ListenOnly 不需要「辅助功能」权限**(会话级只读监听是例外)——
-  本 App 是 ad-hoc 签名,拿不到那个权限,而 `globalShortcut` 不需要 ⇒ 这条路能走;
+  而 `globalShortcut` 同样不需要 ⇒ 这条路不依赖任何授权;
 - 本机实测 `watchControlKey` 返回 `true`(tap 建起来了);
 - **只用它"看",不用它"吞"** —— 吞键交给系统热键做。
 
 ### 为什么不改成自建主动 tap
 
-主动 tap(能吞键)**需要「辅助功能」权限**,Electron 是 ad-hoc 签名 ⇒ 拿不到。
-`globalShortcut` 由系统替你吞键 ⇒ 既不漏按键、也不需要权限。
+主动 tap(能吞键)**需要「辅助功能」权限**;`globalShortcut` 由系统替你吞键
+⇒ 既不漏按键、也不需要权限。
+
+> 2026-10-24 更正:原文写「Electron 是 ad-hoc 签名 ⇒ 拿不到那个权限」。
+> 签名与能不能拿到权限**没有因果关系**(ad-hoc 的 App 一样能被授权)——
+> 那条说法已随「为保留授权而做的那套机制」一起作废。
 
 > ADR-0013(Tauri 仓库)约束的是**界面层**逐字照搬;机制不同有先例
 > (ADR-0020 的 Carbon TIS 那条线两边机制就不同)。
