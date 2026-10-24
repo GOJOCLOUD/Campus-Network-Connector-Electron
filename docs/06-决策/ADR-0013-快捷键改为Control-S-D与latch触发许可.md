@@ -99,15 +99,31 @@ Control 按下        ⇒ 只有 blocked == false 时才 armed = true
 
 ## 四、诚实的边界
 
-### ① Windows 线**没有 latch**
+### ① Windows 线**曾经**没有 latch(2026-10-24 已补上)
 
-`win-input` 模块里**没有**这个只读监听 ⇒ Windows 上 `canLatch` 恒为 false。
-这是**平台差异**,不是遗漏。
+**原状**:`win-input` 模块里没有这个只读监听 ⇒ Windows 上 `canLatch` 恒为 false。
 
-### ② `win` 分支本轮**没动**
+**现已补上**:`win-input` 新增 `watchControlKey` —— 用 `GetAsyncKeyState(VK_CONTROL)`
+**轮询 + 边沿检测**(25ms)观察 Control 的按下/松开,喂给**同一份** latch 状态机
+(`shortcut-latch.cjs`,与 mac 分支**字节相同**)。
+- 选轮询而不是低级键盘钩子:`GetAsyncKeyState` 读**物理键盘状态**,
+  **不受 `RegisterHotKey`/globalShortcut 注册影响** ⇒ 即使组合键被系统热键吞了,
+  也拿得到 Control 的真实按下/松开;也没有 `WH_KEYBOARD_LL` 的 LowLevelHooksTimeout 风险。
+- 拿不到观察源时仍然**如实降级**(`latch=false` + warn),**不假装 latch 生效**。
 
-Windows 包在 `win` 分支上(与 `mac` 分支独立,CI 按分支出包)⇒
-**Windows 包仍是 ⌃⇧A / ⌃⇧D,也没有 latch**。是否同步需单独一轮方案。
+⚠️ **机制不同、规则一字不差**:mac 靠事件 tap 的边沿,Windows 靠轮询。
+规则(触发⇒锁;只有 Control 松开才解锁;Control 按下不能无条件解锁)两边同源同码。
+
+### ② `win` 分支已于 2026-10-24 对齐(见 `ADR-0013-Windows线与macOS线行为对齐.md`)
+
+Windows 包在 `win` 分支上(与 `mac` 分支独立,CI 按分支出包)⇒ 本 ADR 的口径
+(⌃S / ⌃D、latch 规则)现在**两边都是真的**,不再是"待同步"。
+
+**但机制层面的差异仍在**(已写进 Windows 线那份 ADR 的风险清单):
+- Windows 用系统全局热键(`RegisterHotKey`)**精确匹配** ⇒ `Ctrl+Shift+S` 在 Windows 上
+  **不会**触发,而 mac 侧(自己监听)**会**触发 —— 这是"只认 Control、带 Shift 也触发"
+  这条规则在 Windows 上的**实现差异**,不是规则差异。
+- mac 是**主动 tap**,能**吞掉**按键;Windows 由系统热键吞 ⇒ 效果相近但不完全等价。
 
 ### ③ latch 挡的是**触发**,不是"没发生"
 

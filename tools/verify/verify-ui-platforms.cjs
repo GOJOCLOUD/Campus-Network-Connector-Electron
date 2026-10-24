@@ -150,16 +150,20 @@ async function probe(page) {
       await page.close();
     }
 
-    // ── Windows:两个步骤,且没有快捷输入/录制 ──
+    // ── Windows:三个步骤(激活 + 默认执行 + 键盘输入),没有「模拟点击」──
+    //
+    // 2026-10-24:Windows 补上了「键盘输入」(拼音自动键入)这一步 ——
+    // ADR-0012 明确 Windows 线**保留**「拼音自动键入」,而且后端通道是通的
+    // (`win-input` 的 sendText 直接送 Unicode,不依赖 macOS 的输入源切换)。
+    // 「模拟点击(录制)」仍然不出现(ADR-0012:Windows 线不做录制)。
     {
       const page = await browser.newPage();
       await page.evaluateOnNewDocument(stub('win32'));
       await page.goto(base, { waitUntil: 'networkidle0' });
       await new Promise((r) => setTimeout(r, 600));
       const s = await probe(page);
-      check('Windows 只渲染 2 个步骤', s.steps === 2, `实际 ${s.steps}`);
+      check('Windows 渲染 3 个步骤', s.steps === 3, `实际 ${s.steps}`);
       check('Windows 界面上没有「模拟点击」', !s.text.includes('模拟点击'));
-      check('Windows 界面上没有「键盘输入」', !s.text.includes('键盘输入'));
       check('Windows 保留「默认执行」', s.text.includes('默认执行'));
       check('Windows 保留「选择录制」', s.text.includes('选择录制'));
       check('Windows 保留「管理」入口(文件管理不能跟着录制界面一起没掉)', s.text.includes('管理'));
@@ -179,6 +183,21 @@ async function probe(page) {
       await new Promise((r) => setTimeout(r, 400));
       const back = await probe(page);
       check('Windows 点「返回」回到执行面板', back.text.includes('默认执行') && !back.text.includes('管理录制文件'));
+
+      // 第 3 步必须**真的是**「键盘输入」(拼音自动键入)——
+      // 界面上有这一步 ≠ 这一步是能用的面板,所以点过去看一眼标题。
+      // (body.innerText 只含**当前可见**的那一步,所以得点过去才看得到。)
+      await page.evaluate(() => {
+        const circles = [...document.querySelectorAll('div')]
+          .filter((d) => typeof d.className === 'string'
+            && d.className.includes('h-8') && d.className.includes('w-8')
+            && d.className.includes('rounded-full'));
+        const target = circles[2];
+        if (target && target.parentElement) target.parentElement.click();
+      });
+      await new Promise((r) => setTimeout(r, 500));
+      check('Windows 第 3 步是「键盘输入」(拼音自动键入)',
+        (await probe(page)).text.includes('键盘输入'));
       await page.close();
     }
   } finally {
