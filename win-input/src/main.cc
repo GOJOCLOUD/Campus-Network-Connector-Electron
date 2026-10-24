@@ -3,6 +3,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -718,8 +719,16 @@ Napi::Value WatchControlKey(const Napi::CallbackInfo& info) {
 }
 
 // env 销毁前把观察线程停掉 —— 否则它会往一个已经销毁的 env 上投递。
-// (CleanupHook 的析构**不会**注销钩子,所以这里注册了就一直有效。)
-static void stopControlWatchOnEnvCleanup(void* /*data*/) {
+//
+// ⚠️ 钩子签名必须是 **无参**的 `void()`:
+//   `AddCleanupHook(Hook)` 走的是 `CleanupHook<Hook, void>`,
+//   它的 wrapper 回调是 `hook()`(不带参数)——
+//   传 `void(*)(void*)` 会编译报 "too few arguments for call"
+//   (2026-10-24 Windows CI 第一次编原生模块就是这么红的。)
+//
+// (CleanupHook **没有析构函数** ⇒ 这里返回的临时对象析构时**不会**注销钩子,
+//  钩子一直有效。)
+static void stopControlWatchOnEnvCleanup() {
     stopControlWatch();
 }
 
