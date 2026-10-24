@@ -116,6 +116,9 @@ Windows **没有「输入源」这个概念** ⇒ `sendText` 直接送 Unicode �
 
 | 能力 | macOS | Windows | 性质 |
 | --- | --- | --- | --- |
+| 界面步骤数 | **4 步**:激活 → 默认执行 → 模拟点击 → 键盘输入 | **3 步**:激活 → 默认执行 → **键盘输入** | 平台必需(Windows 不做录制) |
+| 「模拟点击(录制)」入口 | 有 | **不出现**(原生层有 `WH_MOUSE_LL` 的能力,但按 ADR-0012 不作为正式功能开放) | 平台必需 |
+| 「键盘输入(拼音自动键入)」入口 | 有 | **有** —— Windows 的 `sendText` 直接送 Unicode(WM_CHAR / KEYEVENTF_UNICODE),不依赖输入源切换 | **已对齐**(ADR-0012 明确 Windows 保留这一项) |
 | 「辅助功能」授权 | 需要,界面显示小问号 | **不需要**(SendInput 不需要授权) | 平台必需 |
 | 「辅助功能」小问号的写法 | `showAccessibilityBadge` 由 App 决定 | **显式传 `showAccessibilityBadge={false}`** | 形状一致,值不同 |
 | Safari 复制修复 | 有 | 无(无 Safari) | 平台必需 |
@@ -126,6 +129,29 @@ Windows **没有「输入源」这个概念** ⇒ `sendText` 直接送 Unicode �
 **"显式"是什么意思**:Windows 侧**显式**传 `showAccessibilityBadge={false}`,
 而不是"没传那个 prop"。这样两个分支的 `App.jsx` 形状一致 ——
 以后有人加这个 prop 时,不会因为"Windows 没传"就以为那边不需要。
+
+### 4.1 「完成」按钮:Windows 为什么也显示
+
+最后一步点「完成」会把**整个面板收起**(`isCompleted` → 高度 0),
+收起后还能靠顶上的步骤圈点回来。
+
+- **以前** Windows 只有两步,最后一步正是主操作界面「默认执行」——
+  那一屏被收起就没法操作了 ⇒ `hideCompleteButton={isWindows}` 把按钮藏了。
+- **现在**(2026-10-24 补上「键盘输入」这一步)Windows 的最后一步是「键盘输入」,
+  和 macOS 一样**不是**主操作界面 ⇒ **照常显示**,与 macOS 行为一致
+  (`hideCompleteButton={false}`)。
+
+「管理录制文件」的入口**仍然**挂在「默认执行」那一步(`showManage: isWindows`):
+它管的是录制文件,和「键盘输入」没关系 —— Windows 上没有「模拟点击」那一步可挂。
+
+### 4.2 录制那条:原生层对齐了,界面入口仍然没有
+
+本轮把**录制链路**按 mac 的形状对齐了(排除矩形由主进程算、单条删除、
+`stopRecording` 不清空)—— 那是**代码形状**的对齐。
+但**界面入口**在 Windows 上仍然不出现(ADR-0012:Windows 线不做录制)。
+
+⇒ 也就是说:Windows 上那套录制代码是**备着但没开**的。
+真要开,得先给 ADR-0012 改口径(那是**加功能**,要单独授权),不是本轮的事。
 
 ## 五、取舍与风险
 
@@ -184,6 +210,24 @@ Windows 线的 CI(`build-windows.yml`)现在跑**与 mac 同级**的门禁,
 **本轮在 win 分支上补上了**(之前没有),而且它当场抓到了一个真问题:
 `build.files` 白名单里**漏了 `playback-guard.cjs`**,而 `main.js` 顶层就要 `require` 它
 ⇒ 那个包**装上即崩**。`shortcut-latch.cjs` 本轮新增,同样进了白名单。
+
+### 找浏览器的逻辑必须是**唯一入口**
+
+界面层那几条门禁要真的开一个浏览器(puppeteer)。这段"找 Chrome"的逻辑
+曾经被**复制在多个文件**里,改一处忘一处就会漂移 ——
+2026-10-24 Windows CI 第一次跑这些用例就是这么红的:
+那段代码只认 `process.env.HOME`,而 **Windows 上没有 `HOME`**
+(只有 `USERPROFILE` / `LOCALAPPDATA`)⇒ 拼出来是个**相对路径**
+`.cache/puppeteer` ⇒ 断言"找不到 Chrome"⇒ 门禁变红
+—— 而**门禁本身没毛病**,是它找不到浏览器。
+
+⇒ 抽成 **`tools/chrome-path.cjs`**(唯一入口,跨平台):
+`PUPPETEER_EXECUTABLE_PATH` → `puppeteer.executablePath()` →
+手动扫各平台缓存目录(mac / Linux / Windows)→ Windows 再兜底找系统自带 Edge / Chrome。
+所有测试脚本只 `require` 它,不再各写一份。
+
+**教训**:门禁红的时候,先分清是**门禁本身坏了**还是**门禁的前置条件没满足** ——
+这次是后者。抽成唯一入口比在每个文件里各修一遍更省事,也更不容易再漂。
 
 ## 七、教训
 

@@ -12,9 +12,13 @@ import { USER_AGREEMENT_MD, TRIAL_SECONDS } from './lib/user-agreement'
 const cnc = window.cnc || {};
 // macOS 用原生红绿灯,其它平台才需要自绘关闭按钮
 const isMac = cnc.platform === 'darwin';
-// Windows 版是**精简版**:只保留「激活 + 默认执行(回放/挑文件)」。
-// 录制(ClickPanel)和快捷输入(KeyboardPanel)都依赖 macOS 原生能力
-// (CoreGraphics 事件监听 / 输入源切换),在 Windows 上跑不通也不需要,故不出现。
+// Windows 线是**精简版**:保留「激活 + 默认执行(回放/挑文件)+ 键盘输入(拼音自动键入)」,
+// **不做「模拟点击(录制)」** —— 见 ADR-0012 的平台功能范围。
+// - 键盘输入在 Windows 上是**通的**:`win-input` 的 `sendText` 直接送 Unicode
+//   (WM_CHAR / KEYEVENTF_UNICODE),不依赖 macOS 的输入源切换 ⇒ 这一页必须**露出来**
+//   (ADR-0012 的判定:Windows 线在界面上原生能力只剩「拼音输入」这一项)。
+// - 录制在 Windows 上**原生层做得到**(`win-input` 的低级鼠标钩子 WH_MOUSE_LL),
+//   但按 ADR-0012 **不作为正式功能开放** ⇒ 界面上不出现这一步的入口。
 const isWindows = cnc.platform === 'win32';
 
 function App() {
@@ -230,14 +234,16 @@ function App() {
     const onKeyDown = (e) => {
       // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
       // 只认 **Control**:不认 Win/Alt,也不要求 Shift(带 Shift 照样触发)——
-      // 与 mac 分支**逐字一致**(见 ADR-0026)。
+      // 与 mac 分支**逐字一致**(见 ADR-0013)。
       //
-      // ⚠️ `!isWindows` 是 mac 分支带来的:那边 Windows 线**没有** ⌃D 这个能力,
-      //   所以在 Windows 上特意关掉。这一条现在**不适用**了 —— Windows 线也有 ⌃D
-      //   (全局快捷键在主进程注册,见 main.js 的 registerShortcuts)。
-      //   这里的 `!isWindows` 保留着,是为了**不与全局快捷键重复触发**
-      //   (两个都生效 = 剪贴板内容被键入两遍)。
-      //   全局注册失败(快捷键被别的程序抢走)时,主进程那条路兜底。
+      // ⚠️ ⌃D 这一条在 **Windows 上不走这里**:Windows 线的 ⌃D 由**主进程的全局
+      //   快捷键**接管(main.js 的 registerShortcuts:读剪贴板 → `sendText` 逐字键入)。
+      //   全局热键由系统吞掉按键,渲染进程**收不到** Ctrl+D 的 keydown
+      //   ⇒ 不会两条路都触发(都触发 = 剪贴板内容被键入两遍)。
+      //   这里的 `!isWindows` 与 mac 分支保持一致 —— 别只改一边。
+      //
+      //   (Windows 上「键盘输入」那一页是**手动**键入,和 ⌃D 的剪贴板直入
+      //   不是一回事:那页是用户自己敲内容,⌃D 是把剪贴板直接敲进去。)
       if (e.ctrlKey && e.code === 'KeyS') {
         e.preventDefault()
         defaultExecuteRef.current()
@@ -552,7 +558,10 @@ function App() {
     filesLoading,
     jsonFiles,
     onSelectFile: (name) => { setSelectedJson(name); setShowJsonDropdown(false) },
-    // Windows 上没有录制界面 → 把「管理录制文件」的入口挂在这一步
+    // 「管理录制文件」的入口:macOS 上在「模拟点击」那一步里,
+    // Windows 上没有那一步 ⇒ 挂在「默认执行」这一步。
+    // (补了「键盘输入」那一步之后**仍然**挂在这里 —— 它管的是录制文件,
+    //  和「键盘输入」没关系。)
     showManage: isWindows,
     isManageMode,
     onManage: handleManage,
@@ -637,7 +646,15 @@ function App() {
         nextButtonText="下一步"
         disableStepIndicators={!isActivated}
         nextDisabled={!isActivated}
-        hideCompleteButton={isWindows}
+        // 「完成」按钮:**显示**(和 macOS 一致)。
+        //
+        // 最后一步点「完成」会把整个面板**收起**(isCompleted → 高度 0),
+        // 收起后还能靠顶上的步骤圈再点回来。
+        // 以前 Windows 只有两步、最后一步正是主操作界面「默认执行」——
+        // 那一屏被收起就没法操作了,所以那时候把这个按钮藏了。
+        // 2026-10-24 补上「键盘输入」这一步之后,Windows 的最后一步
+        // 也变成「键盘输入」(和 macOS 一样)**不是**主操作界面 ⇒ 按钮照常显示。
+        hideCompleteButton={false}
         corner={
           /* macOS 用原生红绿灯(见 main.js 的 titleBarStyle/trafficLightPosition),
              这里只给没有原生按钮的平台兜底 */
@@ -662,19 +679,18 @@ function App() {
           <DefaultExecutePanel {...defaultExecutePanelProps} />
         </Step>
 
-        {/* 以下两步是 macOS 专属:录制要事件监听,快捷输入要切换输入源。
-            Windows 版到「默认执行」为止,少两个界面但功能不缺。 */}
+        {/* 「模拟点击(录制)」这一步在 Windows 上不出现 —— 按 ADR-0012,
+            Windows 线不做录制(原生层虽有 WH_MOUSE_LL 的能力,但不作为正式功能开放)。
+            「键盘输入(拼音自动键入)」两步都有:Windows 的 `sendText` 直接送 Unicode。 */}
         {!isWindows && (
           <Step>
             <ClickPanel {...clickPanelProps} />
           </Step>
         )}
 
-        {!isWindows && (
-          <Step>
-            <KeyboardPanel {...keyboardPanelProps} />
-          </Step>
-        )}
+        <Step>
+          <KeyboardPanel {...keyboardPanelProps} />
+        </Step>
       </Stepper>
 
 <RenameDialog {...renameDialogProps} />

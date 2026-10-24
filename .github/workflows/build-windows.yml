@@ -52,6 +52,24 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # 界面层的门禁要真的开一个浏览器(puppeteer)。
+      # 找浏览器的逻辑在 `tools/chrome-path.cjs`(唯一入口,跨平台):
+      # 它除了 puppeteer 自己的缓存目录,还会兜底找 Windows 上系统自带的 Edge/Chrome。
+      # 这里再**显式**装一次 puppeteer 要的那个版本 —— 装不上也不算失败
+      # (网络抖一下不该拦住发包,共享模块还有系统浏览器兜底)。
+      - name: Install Chrome for the UI regression tests
+        shell: pwsh
+        run: |
+          $cache = Join-Path $env:USERPROFILE ".cache\puppeteer"
+          $chrome = Get-ChildItem -Path $cache -Recurse -Filter "chrome.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $chrome) {
+            Write-Host "puppeteer 的浏览器没装,现在装(装不上也不拦住:还有系统 Edge/Chrome 兜底)..."
+            npx puppeteer browsers install chrome
+            if ($LASTEXITCODE -ne 0) { Write-Host "装浏览器失败,交给 tools/chrome-path.cjs 兜底找系统浏览器" }
+          } else {
+            Write-Host "浏览器已就位: $($chrome.FullName)"
+          }
+
       # 硬门禁:界面层的回归(跑不过就不发包)。
       # - 换页时内容区**底下**那条横向滚动条不许再出现
       #   (用户反馈「下面有个滑条在滑动」),画面横滑的动画不许丢;
