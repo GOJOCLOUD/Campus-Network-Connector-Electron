@@ -585,6 +585,8 @@ async function playClicks(clicks, interval, inputs) {
   const penetrated = setWindowPassthrough(true);
   let executed = 0;
   let skipped = 0;
+  // 第一次失败的原因(与 Tauri 版同口径:记第一个错误,但**继续往下走**)。
+  let error = '';
   try {
     for (let i = 0; i < clicks.length; i++) {
       const c = clicks[i];
@@ -594,14 +596,28 @@ async function playClicks(clicks, interval, inputs) {
       if (!penetrated && pointInOwnWindow(c.x, c.y)) {
         skipped += 1;
       } else {
-        nativeCall('mouseClick', c.x, c.y);
-        executed += 1;
+        // **发不出去就不算执行**(与 Tauri 版同口径)。
+        //
+        // 原生层没有「辅助功能」权限时会抛错 ⇒ 这里拿到 null ⇒
+        // 系统把事件**静默丢弃**了,屏幕上什么都没发生 ——
+        // 那种情况下把它计成"执行了"就是骗人(用户看到计数在涨,却什么都没发生)。
+        const sent = nativeCall('mouseClick', c.x, c.y);
+        if (sent === null) {
+          if (!error) {
+            error = '模拟点击发不出去(通常是系统没给「辅助功能」权限:'
+              + '系统设置 → 隐私与安全性 → 辅助功能 → 勾选本应用)';
+          }
+        } else {
+          executed += 1;
+        }
       }
       await sleepMs(100);
 
       if (perClickInputs && perClickInputs[i]) {
         await sleepMs(100);
-        nativeCall('sendText', perClickInputs[i]);
+        if (nativeCall('sendText', perClickInputs[i]) === null && !error) {
+          error = '键入文本发不出去(通常是系统没给「辅助功能」权限)';
+        }
       }
 
       if (i < clicks.length - 1) {
@@ -614,7 +630,7 @@ async function playClicks(clicks, interval, inputs) {
     // 哪怕中途抛错,也要把闸放开,否则回放再也起不来。
     playbackGuard.finish();
   }
-  return { executed, skipped, rejected: false };
+  return { executed, skipped, rejected: false, error };
 }
 
 async function pinyinType(text, delaySeconds = 3, autoSwitchIme = false) {
@@ -638,12 +654,53 @@ async function pinyinType(text, delaySeconds = 3, autoSwitchIme = false) {
 
 // ── IPC Handlers ──
 
+// 发合成事件之前的**权限前置检查**(macOS)。
+//
+// ## 为什么必须有
+//
+// 没有「辅助功能」权限时,`CGEventPost` 会被系统**静默丢弃**:
+// 命令返回成功、界面显示「开始执行」,但屏幕上什么都没发生 ——
+// 用户只会觉得"这个软件是坏的"(2026-10-24 用户原话:「默认执行是没有功能的」)。
+//
+// 所以这里提前拦下来,把原因**直接**告诉界面 ——
+// 界面本来就会显示 `result.message`,不用为它另开一条通路。
+//
+// 与 Tauri 版同口径(那边是原生层的 `require_accessibility` 闸门;
+// 这里是**入口处**再拦一道,让用户立刻看到原因,而不是等回放跑完)。
+const ACCESSIBILITY_HINT =
+  '没有「辅助功能」权限,模拟点击/键入发不出去:'
+  + '系统设置 → 隐私与安全性 → 辅助功能 → 勾选本应用(改完要重开软件)';
+
+function accessibilityBlocked() {
+  if (process.platform !== 'darwin') return false;   // Windows 的 SendInput 不需要授权
+  if (!native) return false;                         // 模块没加载是另一个错(界面已有横幅)
+  return nativeCall('accessibilityTrusted') !== true;
+}
+
 // Window controls (unchanged)
 ipcMain.handle('window:quit', () => app.quit());
 ipcMain.handle('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
 ipcMain.handle('window:maximize', () => {
   if (!mainWindow) return;
   mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+});
+
+// 打开「系统设置 → 隐私与安全性 → 辅助功能」。
+//
+// 界面上的小问号点一下就该把人送到能改的地方,而不是让人自己找路径
+// (与 Tauri 版 `open_accessibility_settings` 同口径)。
+ipcMain.handle('window:openAccessibilitySettings', async () => {
+  if (process.platform !== 'darwin') {
+    return { ok: false, error: '只有 macOS 有「辅助功能」设置页' };
+  }
+  try {
+    execFileSync('open', [
+      'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+    ], { stdio: 'ignore' });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
 });
 
 // Settings (unchanged)
@@ -719,7 +776,16 @@ ipcMain.handle('native:getStatus', async () => ({
   ok: !!native,
   error: nativeModuleError,
   platform: process.platform,
+  // 发合成点击/按键需要 macOS 的「辅助功能」权限;
+  // 没有的话事件会被系统**静默丢弃**(命令返回成功,但什么都没发生)。
+  // 所以这个状态必须报给界面(与 Tauri 版同口径)。
+  accessibilityTrusted: nativeCall('accessibilityTrusted') === true,
 }));
+
+// 让系统弹出「辅助功能」授权框(用户在弹窗里点「允许」)。
+ipcMain.handle('native:requestAccessibility', async () => {
+  return nativeCall('requestAccessibility') === true;
+});
 
 ipcMain.handle('native:mouseClick', async (_e, x, y) => {
   return nativeCall('mouseClick', x, y);
@@ -878,6 +944,9 @@ ipcMain.handle('file:readFile', async (_e, filename) => {
 // Playback (runs asynchronously)
 ipcMain.handle('play:playFile', async (_e, fileName, interval, inputText) => {
   try {
+    if (accessibilityBlocked()) {
+      return { status: 'error', message: ACCESSIBILITY_HINT };
+    }
     // 闸 ① 的**入口检查**:起回放之前同步问一次 ——
     // 这样界面能**立刻**知道"被拒绝了",而不是等整个回放跑完才发现。
     if (playbackBusy()) {
@@ -902,6 +971,9 @@ ipcMain.handle('play:playFile', async (_e, fileName, interval, inputText) => {
 
 ipcMain.handle('play:playData', async (_e, clicks, interval) => {
   try {
+    if (accessibilityBlocked()) {
+      return { status: 'error', message: ACCESSIBILITY_HINT };
+    }
     if (playbackBusy()) {
       return { status: 'error', message: '上一次回放还没结束,这次没有重复执行' };
     }
@@ -913,6 +985,9 @@ ipcMain.handle('play:playData', async (_e, clicks, interval) => {
 });
 
 ipcMain.handle('play:pinyinInput', async (_e, text, delaySeconds, autoSwitchIme) => {
+  if (accessibilityBlocked()) {
+    return { status: 'error', message: ACCESSIBILITY_HINT };
+  }
   pinyinType(text || '', delaySeconds, autoSwitchIme).catch(e => console.error('[pinyin] error:', e));
   return { status: 'success', message: `将在 ${delaySeconds || 3} 秒后开始输入` };
 });
@@ -976,6 +1051,12 @@ function createWindow() {
 // ── Shortcuts ──
 
 async function triggerDefaultExecute() {
+  // **权限前置检查**:没有「辅助功能」权限时,合成点击会被系统静默丢弃 ——
+  // 回放"跑完了"但屏幕上什么都没发生,用户只会觉得"默认执行没有功能"。
+  if (accessibilityBlocked()) {
+    console.error('[trigger] ' + ACCESSIBILITY_HINT);
+    return;
+  }
   let fileName = (selectedJsonSetting || '').trim();
   if (!fileName) {
     const files = listClickFiles();
@@ -999,11 +1080,39 @@ async function triggerDefaultExecute() {
 }
 
 async function triggerPinyinFromClipboard() {
+  if (accessibilityBlocked()) {
+    console.error('[trigger] ' + ACCESSIBILITY_HINT);
+    return;
+  }
   const source = pinyinSourcesSetting?.shortcut === 'textbox' ? 'textbox' : 'clipboard';
   const t = (source === 'textbox' ? pinyinTextSetting : clipboard.readText() || '').trim();
   if (!t) return;
 
   await pinyinType(t, 0, !!autoSwitchImeSetting);
+}
+
+// 启动时主动**索要**「辅助功能」权限。
+//
+// ## 为什么要有
+//
+// 没有这个权限,合成点击/按键会被系统**静默丢弃** ⇒
+// 「默认执行」(回放)、键入文本、录制**全都没功能**,而界面还不报错
+// (2026-10-24 用户原话:「默认执行是没有功能的」)。
+//
+// 让系统弹一次授权框,用户在弹窗里点「允许」就完事 ——
+// 比"自己去系统设置里把这个 App 拖进列表"省事得多。
+//
+// 已经有权限时**什么都不做**(系统也不会重复弹)。
+function requestAccessibilityIfNeeded() {
+  if (process.platform !== 'darwin') return;
+  if (!native) return;
+  if (nativeCall('accessibilityTrusted') === true) return;
+  try {
+    nativeCall('requestAccessibility');
+    console.log('[accessibility] 没有「辅助功能」权限,已向系统申请(授权后模拟点击/键入才能发出去)');
+  } catch (_) {
+    // 请求本身失败不影响 App 启动 —— 界面上还有小问号可以点。
+  }
 }
 
 function registerShortcuts() {
@@ -1069,6 +1178,7 @@ app.on('ready', () => {
   startKeepalive();
   initFeatures();
   runRecordingExclusionDiag();
+  requestAccessibilityIfNeeded();
 });
 
 // 启动参数带 `--diag-recording-exclusion` 时,跑一次

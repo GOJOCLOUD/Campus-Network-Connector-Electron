@@ -1,12 +1,53 @@
 #include <napi.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <Carbon/Carbon.h>
+#include <ApplicationServices/ApplicationServices.h>
 #include <thread>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <vector>
 #include <unistd.h>
+
+// ── 辅助功能权限 ───────────────────────────────────────────────────
+//
+// 发合成点击/按键(`CGEventPost`)需要 macOS 的「辅助功能」权限。
+// **没有权限时系统会静默丢弃事件**:命令照样返回成功,屏幕上却什么都没发生。
+// 所以必须查出来报到界面上,并在发之前就拦下来 —— 不然用户只会觉得"软件坏了"
+// (这正是 Electron 版之前的状态:回放计数照加,屏幕上一点反应都没有)。
+//
+// 与 Tauri 版同口径(`commands/native/macos.rs` 的 `require_accessibility`)。
+static bool accessibilityTrusted() {
+    return AXIsProcessTrusted() ? true : false;
+}
+
+/// 请求系统弹出授权提示(用户在弹窗里点「允许」即可)。
+static bool requestAccessibility() {
+    const void* keys[] = { kAXTrustedCheckOptionPrompt };
+    const void* vals[] = { kCFBooleanTrue };
+    CFDictionaryRef options = CFDictionaryCreate(
+        kCFAllocatorDefault, keys, vals, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!options) return false;
+    bool trusted = AXIsProcessTrustedWithOptions(options) ? true : false;
+    CFRelease(options);
+    return trusted;
+}
+
+/// 发合成事件前的**权限闸门**。
+///
+/// 没有权限 ⇒ 直接抛错,把原因带回去(界面会显示出来),
+/// **绝不假装成功** —— 假装成功就是"计数照加、屏幕上什么都没发生"。
+static bool requireAccessibility(Napi::Env env, const char* what) {
+    if (accessibilityTrusted()) return true;
+    Napi::Error::New(
+        env,
+        std::string(what) +
+            "需要「辅助功能」权限:系统设置 → 隐私与安全性 → 辅助功能 → "
+            "勾选本应用(改完要重开软件)")
+        .ThrowAsJavaScriptException();
+    return false;
+}
 
 // ── Recording Globals ────────────────────────────────────────────────────
 // We use a polling approach instead of ThreadSafeFunction to avoid
@@ -191,6 +232,7 @@ static void recordingThreadFunc() {
 
 Napi::Value MouseClick(const Napi::CallbackInfo& info) {
     auto env = info.Env();
+    if (!requireAccessibility(env, "模拟点击")) return env.Undefined();
     double x = info[0].As<Napi::Number>().DoubleValue();
     double y = info[1].As<Napi::Number>().DoubleValue();
     CGPoint pt = CGPointMake(x, y);
@@ -359,6 +401,7 @@ Napi::Value TapFailed(const Napi::CallbackInfo& info) {
 
 Napi::Value SendText(const Napi::CallbackInfo& info) {
     auto env = info.Env();
+    if (!requireAccessibility(env, "键入文本")) return env.Undefined();
     std::string text = info[0].As<Napi::String>().Utf8Value();
     if (text.empty()) return Napi::Boolean::New(env, false);
 
@@ -391,6 +434,7 @@ Napi::Value SendText(const Napi::CallbackInfo& info) {
 
 Napi::Value SendKey(const Napi::CallbackInfo& info) {
     auto env = info.Env();
+    if (!requireAccessibility(env, "发送按键")) return env.Undefined();
     CGKeyCode kc = static_cast<CGKeyCode>(
         info[0].As<Napi::Number>().Int32Value());
     CGEventFlags flags = 0;
@@ -599,7 +643,23 @@ Napi::Value WatchControlKey(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, g_controlTapReady.load());
 }
 
+// ── 辅助功能权限 ────────────────────────────────────────────────────
+//
+// `accessibilityTrusted` = 现在有没有「辅助功能」权限(界面拿它显示小问号);
+// `requestAccessibility`  = 让系统弹授权框(用户在弹窗里点「允许」)。
+Napi::Value AccessibilityTrusted(const Napi::CallbackInfo& info) {
+    return Napi::Boolean::New(info.Env(), accessibilityTrusted());
+}
+
+Napi::Value RequestAccessibility(const Napi::CallbackInfo& info) {
+    return Napi::Boolean::New(info.Env(), requestAccessibility());
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    exports.Set("accessibilityTrusted",
+        Napi::Function::New(env, AccessibilityTrusted));
+    exports.Set("requestAccessibility",
+        Napi::Function::New(env, RequestAccessibility));
     exports.Set("mouseClick",
         Napi::Function::New(env, MouseClick));
     exports.Set("mouseGetPosition",

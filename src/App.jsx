@@ -579,6 +579,15 @@ function App() {
     featureList,
     featureStatus,
     onToggleFeature: toggleFeature,
+    // 「辅助功能」授权状态:不做成占一整条的大横幅,只在第 4 页放一个小问号
+    // (红=还不能用,绿=可以用),点一下直接跳到系统设置。
+    // **只有 macOS 有「辅助功能」这回事**(Windows 的 SendInput 不需要授权),
+    // 所以 Windows 上这个小问号根本不出现,免得误报红色。
+    showAccessibilityBadge: isMac,
+    accessibilityTrusted: isMac
+      ? (nativeStatus ? nativeStatus.accessibilityTrusted === true : null)
+      : null,
+    onOpenAccessibilitySettings: () => cnc.openAccessibilitySettings?.(),
   }
 
   const renameDialogProps = {

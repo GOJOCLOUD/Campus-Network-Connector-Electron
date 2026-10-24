@@ -75,6 +75,11 @@ contextBridge.exposeInMainWorld('cnc', {
   // 原生模块状态（模拟输入等能力是否可用）
   getNativeStatus() { return ipcRenderer.invoke('native:getStatus'); },
 
+  // 「辅助功能」权限（macOS 专有：发合成点击/按键需要它）
+  // —— 与 Tauri 版同口径（ADR-0013：界面层逐字照搬）
+  requestAccessibility() { return ipcRenderer.invoke('native:requestAccessibility'); },
+  openAccessibilitySettings() { return ipcRenderer.invoke('window:openAccessibilitySettings'); },
+
   // 功能模块（通用接口；新增功能前端不用改）
   getFeatures() { return ipcRenderer.invoke('features:list'); },
   getFeatureStatus(prefix) { return ipcRenderer.invoke(prefix + ':getStatus'); },

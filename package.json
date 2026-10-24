@@ -5,7 +5,7 @@
   "type": "commonjs",
   "main": "main.js",
   "scripts": {
-    "build:native": "mkdir -p mac-coregraphics/build/Release && clang++ -std=c++17 -fexceptions -ObjC++ -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk -I node_modules/node-addon-api -I /opt/homebrew/include/node -framework CoreGraphics -framework Carbon -framework Foundation -undefined dynamic_lookup -dynamiclib -o mac-coregraphics/build/Release/mac-coregraphics.node mac-coregraphics/src/main.mm",
+    "build:native": "mkdir -p mac-coregraphics/build/Release && clang++ -std=c++17 -fexceptions -ObjC++ -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk -I node_modules/node-addon-api -I /opt/homebrew/include/node -framework CoreGraphics -framework Carbon -framework Foundation -framework ApplicationServices -undefined dynamic_lookup -dynamiclib -o mac-coregraphics/build/Release/mac-coregraphics.node mac-coregraphics/src/main.mm",
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
