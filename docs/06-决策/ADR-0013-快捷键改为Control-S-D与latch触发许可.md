@@ -28,14 +28,19 @@
 | 快捷键 | 动作 | 平台 |
 | --- | --- | --- |
 | **⌃S** | 「默认执行」= 回放选中的录制文件 | macOS / Windows |
-| **⌃D** | 读剪贴板(或输入框里固定的那段文本)并逐字键入 | 只有 macOS |
+| **⌃D** | 读剪贴板(或输入框里固定的那段文本)并逐字键入 | macOS / Windows |
 
 Electron 侧注册:
 
 ```js
 globalShortcut.register('Ctrl+S', ...)   // 默认执行
-globalShortcut.register('Ctrl+D', ...)   // 剪贴板直入(仅 darwin)
+globalShortcut.register('Ctrl+D', ...)   // 剪贴板直入(macOS 这边多一步「切 ASCII 输入源」)
 ```
+
+> 2026-10-24 更正:⌃D 原来标着「**只有 macOS**」,那是 Windows 线对齐**之前**的状态。
+> 现在两个平台都注册 ⌃D —— Windows 侧靠 `sendText` 直接送 Unicode 字符,
+> 不用切输入源(Windows 没有「输入源」这个概念)。
+> 详见 `ADR-0013-Windows线与macOS线行为对齐.md`。
 
 **只认 Control**:⌘S 是「保存」、⌘D 是「书签」,不能抢。
 
@@ -129,6 +134,22 @@ Windows 包在 `win` 分支上(与 `mac` 分支独立,CI 按分支出包)⇒ 本
 
 锁着的时候,系统热键照样吞掉按键(不往前台漏),只是**不执行动作**。
 
+### ④ 快捷键的诊断字段:两个平台同名同义(2026-10-24 补齐)
+
+`native:getStatus` 现在在两个平台都返回这五栏:
+
+| 字段 | 含义 |
+| --- | --- |
+| `shortcutCtrlS` / `shortcutCtrlD` | 热键**注册**成功没有(被别的 App 抢走就是 `false`) |
+| `latchAvailable` / `controlWatcherRunning` | Control 只读观察器在不在跑(不在跑 ⇒ latch 根本解不开) |
+| `latchArmed` | 当前是不是武装的(锁着就触发不了) |
+
+**为什么必须有**:热键被别的程序抢走是**常见故障**,而 `globalShortcut.register`
+失败**只返回 `false`、不抛错** —— 不报出来就是「按了没反应」而且无从判断原因。
+
+Windows 线本来就有这五栏,mac 线原先**一个都没有** ⇒ 已补齐,
+两个平台的排查顺序从此一致(先看注册、再看观察器、最后看 armed)。
+
 ---
 
 ## 五、回归
@@ -163,6 +184,10 @@ Windows 包在 `win` 分支上(与 `mac` 分支独立,CI 按分支出包)⇒ 本
 
 ## 七、待办(需要单独一轮方案,不在本轮)
 
-- **`win` 分支要不要同步本轮改动**(键位 + latch);
-- **Windows 线要不要补 latch**(需要 Win32 侧的 Control 边沿观察);
 - Electron / Tauri 的 `executed` 计数口径不一致。
+
+> 2026-10-24 更正:原列表里的「`win` 分支要不要同步本轮改动」与
+> 「Windows 线要不要补 latch」**两条都已经做完了** ——
+> Windows 线当天完成对齐,latch 用 `GetAsyncKeyState` 轮询观察 Control 的边沿,
+> 规则与本 ADR **一字不差**。
+> 详见 `ADR-0013-Windows线与macOS线行为对齐.md`。

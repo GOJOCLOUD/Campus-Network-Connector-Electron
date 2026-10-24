@@ -780,6 +780,18 @@ ipcMain.handle('native:getStatus', async () => ({
   // 没有的话事件会被系统**静默丢弃**(命令返回成功,但什么都没发生)。
   // 所以这个状态必须报给界面(与 Tauri 版同口径)。
   accessibilityTrusted: nativeCall('accessibilityTrusted') === true,
+  // 快捷键与 latch 的诊断字段(**与 win 分支同名字同含义**)。
+  //
+  // 排查「按了快捷键没反应」时按这个顺序看:
+  // ① ctrlS / ctrlD —— 热键**注册**成功没有(被别的 App 抢走就是 false);
+  // ② latchAvailable / controlWatcherRunning —— Control 只读观察器在不在跑
+  //    (不在跑 ⇒ latch 根本解不开,按住 Ctrl 连按会连着触发);
+  // ③ latchArmed —— 当前是不是武装的(锁着就触发不了)。
+  shortcutCtrlS: shortcutStatus.ctrlS,
+  shortcutCtrlD: shortcutStatus.ctrlD,
+  latchAvailable: shortcutStatus.latchAvailable,
+  latchArmed: shortcutStatus.latchArmed,
+  controlWatcherRunning: shortcutStatus.controlWatcherRunning,
 }));
 
 // 让系统弹出「辅助功能」授权框(用户在弹窗里点「允许」)。
@@ -1115,6 +1127,26 @@ function requestAccessibilityIfNeeded() {
   }
 }
 
+/**
+ * 快捷键与 latch 的运行状态(诊断用)。
+ *
+ * **与 win 分支同名字、同含义** —— 两个平台的排查顺序一致:
+ * ctrlS/ctrlD 看热键**注册**成没成,latchAvailable/controlWatcherRunning
+ * 看 Control 只读观察器在不在跑,latchArmed 看当前能不能触发。
+ */
+const shortcutStatus = {
+  /** ⌃S(默认执行 = 回放)注册成功没有 */
+  ctrlS: false,
+  /** ⌃D(剪贴板直输)注册成功没有 */
+  ctrlD: false,
+  /** latch 可用吗(= Control 只读观察器起来了没有) */
+  latchAvailable: false,
+  /** 当前是不是武装的(诊断用) */
+  latchArmed: true,
+  /** Control 观察器在不在跑 */
+  controlWatcherRunning: false,
+};
+
 function registerShortcuts() {
   // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
   //
@@ -1126,45 +1158,64 @@ function registerShortcuts() {
   // `globalShortcut` **只在按下时回调**,不告诉你 Control 什么时候松开 ⇒
   // 靠它自己解不开 latch(按住 Ctrl 连按会连着触发;而「默认执行」是回放,
   // 连着触发就是往屏幕上乱点)。
-  // 所以另开一个**只读**监听(CGEventTap ListenOnly,**不需要辅助功能权限**)
+  // 所以另开一个**只读**观察(CGEventTap ListenOnly,**不需要辅助功能权限**)
   // 看 Control 的按下/松开边沿:Control 一松开就重新武装。
   //
-  // ## 规则(**Tauri 版同口径**;见本仓库 ADR-0013 / Tauri 仓库 ADR-0024)
+  // ## 规则(**Tauri 版 / win 分支同口径**;见本仓库 ADR-0013 / Tauri 仓库 ADR-0024)
   //
   // - 触发 ⇒ `armed = false` 且 `blocked = true`;
   // - **Control 松开** ⇒ `blocked = false`、`armed = true`(彻底解锁);
   // - Control 按下 ⇒ **只有 `blocked == false` 时**才武装。
   //
-  // 最后一条是关键:系统热键的回调和只读监听的回调**谁先到不确定**。
-  // 如果「Control 按下」那一下能把 latch 解开,用户按住 Ctrl 连按就会连着
+  // 最后一条是关键:系统热键的回调和只读观察的回调**谁先到不确定**。
+  // 如果「Control 按下」那一下能把 latch 解开,用户按住 Ctrl 连按会连着
   // 触发 —— 而「默认执行」是回放,触发多次就是往屏幕上乱点。
   //
-  // ⚠️ Windows 线没有这个只读监听(那边没有这个原生模块)⇒ **那边没有 latch**,
-  //   维持原有行为。这是有意的平台差异,记在 ADR-0013。
+  // ## 两个平台怎么观察 Control(机制不同,对外形态一致)
+  //
+  // - macOS:`CGEventTap` ListenOnly(不需要辅助功能权限);
+  // - Windows:`win-input` 的 `GetAsyncKeyState(VK_CONTROL)` 轮询 + 边沿检测
+  //   (读物理状态,不受 `RegisterHotKey` 影响,也没有低级钩子的超时风险)。
+  //
+  // ⇒ 对外都是 `nativeCall('watchControlKey', cb)`,**调用形态逐字相同**;
+  // 拿不到观察源时**如实降级**(`latch=false` + 打 warn),**不假装 latch 生效了**。
   //
   // 状态机本身在 `shortcut-latch.cjs`(纯函数)—— 与 Tauri 版 `Latch` 同口径,
   // 回归测试见 `tools/verify/verify-shortcut-latch.cjs`。
   const latch = createShortcutLatch();
-  const watched = process.platform === 'darwin'
-    ? nativeCall('watchControlKey', (ctrlDown) => latch.onCtrlChange(ctrlDown))
-    : null;
+  const watched = nativeCall('watchControlKey', (ctrlDown) => {
+    latch.onCtrlChange(ctrlDown);
+    shortcutStatus.latchArmed = latch.isArmed();
+  });
   const canLatch = watched === true;
-  if (process.platform === 'darwin' && !canLatch) {
-    console.warn('[shortcut] 拿不到 Control 按下/松开的只读监听 ⇒ latch 不可用(按住 Ctrl 连按会连着触发)');
+  if (!canLatch) {
+    console.warn('[shortcut] 拿不到 Control 按下/松开的只读观察 ⇒ latch 不可用(按住 Ctrl 连按会连着触发)');
   }
 
   const fire = (fn, name) => () => {
     // 锁着 ⇒ 不触发(canLatch 为 false 时压根不碰 latch,维持旧行为)。
-    if (canLatch && !latch.tryFire()) return;
+    if (canLatch && !latch.tryFire()) {
+      shortcutStatus.latchArmed = latch.isArmed();
+      return;
+    }
+    shortcutStatus.latchArmed = latch.isArmed();
     fn().catch(e => console.error(`[shortcut] ${name} failed`, e));
   };
 
   const ok1 = globalShortcut.register('Ctrl+S', fire(triggerDefaultExecute, 'default execute'));
-  // 剪贴板直输走的是「输入源切换 + 拼音键入」这套 macOS 打法，
-  // Windows 上没有等价物（那边靠 WM_CHAR 直接送字符），所以不注册这个快捷键。
+  // 剪贴板直输:macOS 这边多一步「切到 ASCII 输入源」(拼音键入需要),
+  // Windows 没有「输入源」这个概念 ⇒ 那边靠 WM_CHAR 直接送字符。
+  // ⇒ **两个平台都注册 ⌃D**,「切输入源」那一步是 macOS 专有(ADR-0012 平台必需差异)。
   const ok2 = process.platform === 'darwin'
     ? globalShortcut.register('Ctrl+D', fire(triggerPinyinFromClipboard, 'pinyin'))
     : null;
+
+  shortcutStatus.ctrlS = ok1 === true;
+  shortcutStatus.ctrlD = ok2 === true;
+  shortcutStatus.latchAvailable = canLatch;
+  shortcutStatus.latchArmed = latch.isArmed();
+  shortcutStatus.controlWatcherRunning = canLatch;
+
   console.log(`[shortcut] Ctrl+S=${ok1} Ctrl+D=${ok2} latch=${canLatch}`);
 }
 
