@@ -228,11 +228,21 @@ function App() {
     // 这里原本还会往屏幕最底下贴一条黑色调试条(显示按键信息)——
     // 那条带子已经删掉了(挡住屏幕底下的内容),但快捷键保留。
     const onKeyDown = (e) => {
-      if (e.ctrlKey && e.shiftKey && e.code === 'KeyA') {
+      // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
+      // 只认 **Control**:不认 Win/Alt,也不要求 Shift(带 Shift 照样触发)——
+      // 与 mac 分支**逐字一致**(见 ADR-0026)。
+      //
+      // ⚠️ `!isWindows` 是 mac 分支带来的:那边 Windows 线**没有** ⌃D 这个能力,
+      //   所以在 Windows 上特意关掉。这一条现在**不适用**了 —— Windows 线也有 ⌃D
+      //   (全局快捷键在主进程注册,见 main.js 的 registerShortcuts)。
+      //   这里的 `!isWindows` 保留着,是为了**不与全局快捷键重复触发**
+      //   (两个都生效 = 剪贴板内容被键入两遍)。
+      //   全局注册失败(快捷键被别的程序抢走)时,主进程那条路兜底。
+      if (e.ctrlKey && e.code === 'KeyS') {
         e.preventDefault()
         defaultExecuteRef.current()
       }
-      if (e.ctrlKey && e.shiftKey && e.code === 'KeyD' && !isWindows) {
+      if (e.ctrlKey && e.code === 'KeyD' && !isWindows) {
         e.preventDefault()
         setMessage('读取剪贴板中...')
         setTimeout(() => setMessage(''), 2000)
@@ -280,12 +290,11 @@ function App() {
       setCountdown(prev => {
         if (prev <= 1) {
           clearInterval(timer)
-          const left = window.screenX
-          const top = window.screenY
-          const right = left + window.outerWidth
-          const bottom = top + window.outerHeight
-          const excludeRect = [left, top, right, bottom]
-          cnc.startRecording(excludeRect)
+          // 「点自己界面上的按钮不算一次点击」由**原生层**负责:
+          // 排除矩形用原生窗口位置算,并在窗口每次移动/变高时刷新。
+          // 这里**不传**矩形 —— 前端那份 `window.screenX` 只是开始那一刻的
+          // 一张快照,窗口一动就过期了(点「结束」会被记成一次点击)。
+          cnc.startRecording()
             .then((ok) => {
               if (ok === true) {
                 setIsRecording(true)
@@ -307,7 +316,20 @@ function App() {
     cnc.stopRecording()
       .then((clickData) => {
         setIsRecording(false)
-        setMessage('录制已停止（返回 ' + (Array.isArray(clickData) ? clickData.length : 0) + ' 个点击）')
+        // null = 停止失败(这时**别**把界面上的记录清掉);
+        // 数组 = 原生那边拿到的点击。
+        // 停止那一刻录到的最后一次点击只有原生那边有(界面是 100ms 轮询,
+        // 可能差最后一次),所以以它为准。
+        const list = Array.isArray(clickData) ? clickData : null
+        if (list) {
+          setClicks(list)
+          setClickInputs(prev => {
+            const next = [...prev]
+            for (let i = 0; i < list.length; i += 1) next[i] = next[i] || ''
+            return next.slice(0, list.length)
+          })
+        }
+        setMessage('录制已停止（返回 ' + (list ? list.length : clicks.length) + ' 个点击）')
         setTimeout(() => setMessage(''), 1000)
       })
       .catch(() => { setMessage('停止失败'); setTimeout(() => setMessage(''), 1000) })
@@ -327,6 +349,16 @@ function App() {
         setTimeout(() => setMessage(''), 1000)
       })
       .catch(() => { setMessage('清空失败'); setTimeout(() => setMessage(''), 1000) })
+  }
+
+  // 单条删除:界面上每一条点击旁边有个「×」,点它只删这一条。
+  // 原生那边也要删**同一条** —— 两边都留着就对不上号了
+  // (原生那份是回放时真正用的)。
+  const handleDeleteClick = (index) => {
+    if (!(index >= 0 && index < clicks.length)) return
+    if (cnc.removeRecordingClick) cnc.removeRecordingClick(index)
+    setClicks(prev => prev.filter((_, i) => i !== index))
+    setClickInputs(prev => prev.filter((_, i) => i !== index))
   }
 
   const handleDefaultExecute = () => {
@@ -541,6 +573,7 @@ function App() {
     onManage: handleManage,
     onSave: handleSaveWithInputs,
     onClear: handleClear,
+    onDeleteClick: handleDeleteClick,
     jsonFiles,
     onRename: handleRename,
     onDelete: handleDelete,
@@ -556,6 +589,13 @@ function App() {
     featureList,
     featureStatus,
     onToggleFeature: toggleFeature,
+    // 「辅助功能」授权状态:**Windows 没有这个概念**
+    // (Windows 的 `SendInput` 不需要辅助功能授权)⇒ 那边不显示这个小问号。
+    //
+    // 但要**显式**传 `showAccessibilityBadge={false}`,而不是"没传那个 prop" ——
+    // 这样两个平台的代码形状一致,以后加功能的人不会漏掉这一条。
+    showAccessibilityBadge: false,
+    accessibilityTrusted: null,
   }
 
   const renameDialogProps = {

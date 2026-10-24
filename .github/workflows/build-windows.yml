@@ -35,12 +35,47 @@ jobs:
       - name: frame-bridge regression test
         run: node --test tools/verify/verify-frame-bridge.cjs
 
+      # 硬门禁:页面守卫的回归测试(跑不过就不发包)。
+      # 盯的是"换题之后新作用域会不会被发现、映射会不会真的到页面上":
+      # 2026-10-23 末那次真机故障(换题后第 1 次复制成功、第 2 次复制出密文)
+      # 就是守卫的几处根因,详见 ADR-0017。
+      # 这套用例要读 vendor/page-guard.js(Electron 侧不入库、由 tools/build-vendor.mjs
+      # 构建),所以先重建产物,测的才是**真正注入网页的那份**。
+      - name: page-guard regression test
+        run: |
+          npm run build:vendor
+          node --test tools/verify/verify-page-guard.cjs
+
+      # 界面层的回归需要**构建出来的 dist/**(真正装进 App 的那份前端),
+      # 所以先单独构建一次 —— 下面的 dist:win 里也会再构建一次,
+      # 重复的是那几十秒,换来的是"跑不过就不发包"这条门禁真的在打包**之前**。
+      - name: Build frontend
+        run: npm run build
+
+      # 硬门禁:界面层的回归(跑不过就不发包)。
+      # - 换页时内容区**底下**那条横向滚动条不许再出现
+      #   (用户反馈「下面有个滑条在滑动」),画面横滑的动画不许丢;
+      # - 录制的**单条删除**,以及「点自己界面上的按钮不算一次点击」的契约
+      #   (开始录制不再由前端传那张会过期的矩形)。
+      - name: UI regression test
+        run: node --test tools/verify/verify-panel-transition.cjs tools/verify/verify-recording-ui.cjs
+
       # 硬门禁:回放的**重入保护**(2026-10-23 T0 事故)。
       # 回放的合成点击落点在自己窗口上 ⇒ 点到自己界面的「默认执行」⇒
       # 无限自激循环 ⇒ 疯狂敲键盘 ⇒ 整台机器卡死(用户被迫强制关机)。
       # 闸①(同一时刻最多一个回放)是纯逻辑、跨平台,Windows 线也必须有。
       - name: playback guard regression test
         run: node --test tools/verify/verify-playback-guard.cjs
+
+      # 硬门禁:快捷键的 latch(触发许可)。
+      # 盯的是「触发之后 Ctrl+D 整个按键就不再会继续影响它了,
+      # 除非下一次重新按住 Ctrl」—— 触发一次就被消费掉,Control 不松开
+      # 就不许再触发。而「默认执行」的动作是**回放**,一次误触发就是
+      # 往用户屏幕上乱点一串合成点击 ⇒ 属于不能靠手测的那类闸。
+      # (Windows 线现在也有 latch 了:win-input 的 watchControlKey
+      #  用 GetAsyncKeyState 轮询做 Control 边沿观察。)
+      - name: shortcut latch regression test
+        run: node --test tools/verify/verify-shortcut-latch.cjs
 
       - name: Build native addon + renderer + NSIS installer
         run: npm run dist:win

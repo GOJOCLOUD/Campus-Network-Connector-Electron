@@ -5,6 +5,8 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const nacl = require('tweetnacl');
+// 快捷键的 latch 状态机(纯函数,能单独测 —— 见 tools/verify/verify-shortcut-latch.cjs)
+const { createShortcutLatch } = require('./shortcut-latch.cjs');
 
 // ── Native addon（按平台加载）──
 // macOS   → mac-coregraphics（CoreGraphics：模拟点击 / 输入 / 输入源 / 录制）
@@ -559,18 +561,41 @@ async function playClicks(clicks, interval, inputs) {
   }
   // **窗口穿透**:回放期间让窗口不接收鼠标事件,
   // 这样回放的点击能落到下面的目标应用上(见 setWindowPassthrough 的说明)。
+  //
+  // ⚠️ 穿透失败时**没有**兜底的「跳过自己窗口上的点击」(mac 侧的闸②)——
+  //   Windows 的 `SendInput` 用绝对屏幕坐标,和窗口 bounds 的量纲在缩放下对不上,
+  //   没核实之前不能开(理由见 `playback-guard.cjs` 的说明)。
+  //   这里把结果**记进日志** —— 不然"穿透没成功"在排障时完全看不见。
   const penetrated = setWindowPassthrough(true);
+  if (!penetrated) {
+    console.warn('[playback] 窗口穿透没成功 —— 合成点击可能落在自己的界面上(闸②在 Windows 上未启用,见 playback-guard.cjs)');
+  }
   let executed = 0;
+  // 第一次失败的原因(与 mac / Tauri 版同口径:记第一个错误,但**继续往下走**)。
+  let error = '';
   try {
     for (let i = 0; i < clicks.length; i++) {
       const c = clicks[i];
-      nativeCall('mouseClick', c.x, c.y);
-      executed += 1;
+      // **发不出去就不算执行**(与 mac / Tauri 版同口径)。
+      //
+      // Windows 上 `SendInput` 被系统拦下时(目标窗口权限更高、锁屏、
+      // 会话切换),原生层会返回 false ⇒ 屏幕上什么都没发生 ——
+      // 那种情况下把它计成"执行了"就是骗人(用户看到计数在涨,却什么都没发生)。
+      const sent = nativeCall('mouseClick', c.x, c.y);
+      if (!sent) {
+        if (!error) {
+          error = '模拟点击发不出去(可能是目标窗口权限更高,或系统正处于锁屏/会话切换状态)';
+        }
+      } else {
+        executed += 1;
+      }
       await sleepMs(100);
 
       if (perClickInputs && perClickInputs[i]) {
         await sleepMs(100);
-        nativeCall('sendText', perClickInputs[i]);
+        if (!nativeCall('sendText', perClickInputs[i]) && !error) {
+          error = '键入文本发不出去(可能没有前台窗口,或目标窗口权限更高)';
+        }
       }
 
       if (i < clicks.length - 1) {
@@ -583,7 +608,7 @@ async function playClicks(clicks, interval, inputs) {
     // 哪怕中途抛错,也要把闸放开,否则回放再也起不来。
     playbackGuard.finish();
   }
-  return { executed, skipped: 0, rejected: false };
+  return { executed, skipped: 0, rejected: false, error };
 }
 
 async function pinyinType(text, delaySeconds = 3, autoSwitchIme = false) {
@@ -688,6 +713,18 @@ ipcMain.handle('native:getStatus', async () => ({
   ok: !!native,
   error: nativeModuleError,
   platform: process.platform,
+  // 快捷键与 latch 的诊断字段(与 mac 分支的 `[shortcut]` 日志同口径)。
+  //
+  // 排查「Windows 上快捷键没反应」时按这个顺序看:
+  // ① ctrlS / ctrlD —— 热键**注册**成功没有(被别的 App 抢走就是 false);
+  // ② latchAvailable / controlWatcherRunning —— Control 只读观察器在不在跑
+  //    (不在跑 ⇒ latch 根本解不开,按住 Ctrl 连按会连着触发);
+  // ③ latchArmed —— 当前是不是武装的(锁着就触发不了)。
+  shortcutCtrlS: shortcutStatus.ctrlS,
+  shortcutCtrlD: shortcutStatus.ctrlD,
+  latchAvailable: shortcutStatus.latchAvailable,
+  latchArmed: shortcutStatus.latchArmed,
+  controlWatcherRunning: shortcutStatus.controlWatcherRunning,
 }));
 
 ipcMain.handle('native:mouseClick', async (_e, x, y) => {
@@ -744,9 +781,28 @@ ipcMain.handle('native:setCurrentAsInputSource', async (_e, role) => {
 });
 
 // Recording
-ipcMain.handle('native:startRecording', async (_e, excludeRect) => {
+
+// 自己窗口在屏幕上的范围(左、上、右、下)—— 主进程手里的是**权威值**。
+//
+// 「点自己界面上的按钮不算一次点击」靠它实现:落在自己窗口范围内的点击不记。
+function ownWindowRect() {
   try {
-    nativeCall('startRecording', excludeRect || [0, 0, 0, 0]);
+    if (!mainWindow || mainWindow.isDestroyed()) return null;
+    const b = mainWindow.getBounds();
+    return [b.x, b.y, b.x + b.width, b.y + b.height];
+  } catch (_) {
+    return null;
+  }
+}
+
+ipcMain.handle('native:startRecording', async () => {
+  try {
+    // 排除矩形用**主进程**的窗口位置算(权威值),不采信渲染进程传过来的那份:
+    // 渲染进程那份是「开始录制那一刻」的快照,窗口一动就过期
+    // ⇒ 点「结束」会被记成一次点击(用户 2026-10-23 报过的 bug)。
+    // 所以前端**不传**矩形。
+    const rect = ownWindowRect();
+    nativeCall('startRecording', rect || []);
     return true;
   } catch (e) {
     return { error: e.message };
@@ -755,9 +811,11 @@ ipcMain.handle('native:startRecording', async (_e, excludeRect) => {
 
 ipcMain.handle('native:stopRecording', async () => {
   nativeCall('stopRecording', );
+  // **不清空**:录到的点击还要留着给「单条删除」用
+  // (界面上删一条,这里也得跟着删一条,两边才对得上)。
   const clicks = nativeCall('getRecordingClicks', );
-  nativeCall('clearRecordingClicks', );
-  return Array.isArray(clicks) ? clicks : [];
+  // null = 失败,界面据此保留原来的记录,不清空。
+  return Array.isArray(clicks) ? clicks : null;
 });
 
 ipcMain.handle('native:getRecordingClicks', async () => {
@@ -767,6 +825,11 @@ ipcMain.handle('native:getRecordingClicks', async () => {
 ipcMain.handle('native:clearRecordingClicks', async () => {
   nativeCall('clearRecordingClicks', );
   return true;
+});
+
+// 删掉第 index 次点击(单条删除)
+ipcMain.handle('native:removeRecordingClick', async (_e, index) => {
+  return nativeCall('removeRecordingClick', Number(index) || 0) === true;
 });
 
 ipcMain.handle('native:isRecording', async () => {
@@ -900,6 +963,20 @@ function createWindow() {
 
   mainWindow.setAlwaysOnTop(true, 'screen-saver');
 
+  // 录制用的「排除矩形」必须**跟着窗口走**。
+  //
+  // 「点自己界面上的按钮不算一次点击」靠它实现:落在自己窗口范围内的点击不记。
+  // 矩形不能只在开始录制时拍一张快照 —— 窗口一动快照就过期了,点「结束」
+  // 会被当成一次外部点击(用户 2026-10-23 报过的 bug)。所以窗口**每次移动/变高**
+  // 都刷新一次。
+  const refreshExcludeRect = () => {
+    const rect = ownWindowRect();
+    if (!rect) return;
+    nativeCall('setExcludeRect', rect);
+  };
+  mainWindow.on('move', refreshExcludeRect);
+  mainWindow.on('resize', refreshExcludeRect);
+
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
   });
@@ -912,6 +989,25 @@ function createWindow() {
 }
 
 // ── Shortcuts ──
+
+// 快捷键与 latch 的**诊断状态**。
+//
+// 「Windows 上快捷键没反应」的排查路径就靠这三个字段(见 docs/05-运维/故障排查.md):
+// ① 快捷键**注册**成功没有(被别的 App 抢走就是 false);
+// ② latch 当前**是不是武装**的(锁着就触发不了);
+// ③ Control 只读**观察器**在不在跑(不跑 ⇒ latch 根本解不开)。
+const shortcutStatus = {
+  /** ⌃S(默认执行 = 回放)注册成功没有 */
+  ctrlS: false,
+  /** ⌃D(剪贴板直输)注册成功没有 */
+  ctrlD: false,
+  /** latch 可用吗(= Control 只读观察器起来了没有) */
+  latchAvailable: false,
+  /** 当前是不是武装的(诊断用) */
+  latchArmed: true,
+  /** Control 观察器线程在不在跑 */
+  controlWatcherRunning: false,
+};
 
 async function triggerDefaultExecute() {
   let fileName = (selectedJsonSetting || '').trim();
@@ -941,21 +1037,89 @@ async function triggerPinyinFromClipboard() {
   const t = (source === 'textbox' ? pinyinTextSetting : clipboard.readText() || '').trim();
   if (!t) return;
 
-  await pinyinType(t, 0, !!autoSwitchImeSetting);
+  // **Windows 不切输入源**:那边没有「输入源」这回事 ——
+  // `win-input` 的 `sendText` 直接送 Unicode(WM_CHAR / KEYEVENTF_UNICODE),
+  // 切输入源不但没必要,还会把用户正在用的输入法状态搅乱。
+  // macOS 那边才需要切到 ASCII 输入源再送(拼音键入靠的是 ASCII 布局)。
+  //
+  // 其余流程(读剪贴板 / textbox 来源 / 空文本处理)与 mac 侧**同构**。
+  const autoSwitch = process.platform === 'darwin' ? !!autoSwitchImeSetting : false;
+
+  console.log(`[shortcut] ⌃D 直输:来源=${source} 长度=${t.length} 切输入源=${autoSwitch}`);
+  await pinyinType(t, 0, autoSwitch);
 }
 
 function registerShortcuts() {
-  const ok1 = globalShortcut.register('Ctrl+Shift+A', () => {
-    triggerDefaultExecute().catch(e => console.error('[shortcut] default execute failed', e));
+  // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
+  //
+  // 与 mac 分支**同口径**(见本仓库 ADR-0013):
+  // - 只认 **Control**:不认 Win/Alt,也不要求 Shift(带 Shift 照样触发);
+  // - 两个快捷键**都要注册** —— Windows 上 ⌃D 现在真的做事
+  //   (读剪贴板 → `sendText` 逐字键入),不再是 macOS 专属。
+  //
+  // ## latch(2026-10-23 用户要求)
+  //
+  // > 「触发之后 Ctrl+D 整个按键就不再会继续影响它了,
+  // > 除非下一次重新按住 Ctrl,再点击相应的字母」
+  //
+  // `globalShortcut` **只在按下时回调**,不告诉你 Control 什么时候松开 ⇒
+  // 靠它自己解不开 latch(按住 Ctrl 连按会连着触发;而「默认执行」是回放,
+  // 连着触发就是往屏幕上乱点)。
+  // 所以另开一个**只读**观察看 Control 的按下/松开边沿:Control 一松开就重新武装。
+  //
+  // ## 规则(**Tauri 版 / mac 版同口径**;见 ADR-0013)
+  //
+  // - 触发 ⇒ `armed = false` 且 `blocked = true`;
+  // - **Control 松开** ⇒ `blocked = false`、`armed = true`(彻底解锁);
+  // - Control 按下 ⇒ **只有 `blocked == false` 时**才武装。
+  //
+  // 最后一条是关键:系统热键的回调和只读观察的回调**谁先到不确定**。
+  // 如果「Control 按下」那一下能把 latch 解开,用户按住 Ctrl 连按会连着
+  // 触发 —— 而「默认执行」是回放,触发多次就是往屏幕上乱点。
+  //
+  // ## Windows 上的只读观察怎么来的
+  //
+  // `win-input` 的 `watchControlKey`:用 `GetAsyncKeyState(VK_CONTROL)` 轮询
+  // (25ms 一次)**做边沿检测**。选它而不是低级键盘钩子的理由见
+  // `win-input/src/main.cc` 的注释:读的是**物理键盘状态**,
+  // **不受 `RegisterHotKey` 影响** ⇒ 组合键被别的程序抢走也照样拿得到边沿;
+  // 也没有 `WH_KEYBOARD_LL` 的 LowLevelHooksTimeout 风险(丢一次边沿 = latch 解不开)。
+  //
+  // 拿不到观察源时**如实降级**(`latch=false` + 打 warn),
+  // **不要假装 latch 生效了**。
+  //
+  // 状态机本身在 `shortcut-latch.cjs`(纯函数)—— 与 Tauri 版 `Latch` 同口径,
+  // 回归测试见 `tools/verify/verify-shortcut-latch.cjs`。
+  const latch = createShortcutLatch();
+  const watched = nativeCall('watchControlKey', (ctrlDown) => {
+    latch.onCtrlChange(ctrlDown);
+    shortcutStatus.latchArmed = latch.isArmed();
   });
-  // 剪贴板直输走的是「输入源切换 + 拼音键入」这套 macOS 打法，
-  // Windows 上没有等价物（那边靠 WM_CHAR 直接送字符），所以不注册这个快捷键。
-  const ok2 = process.platform === 'darwin'
-    ? globalShortcut.register('Ctrl+Shift+D', () => {
-      triggerPinyinFromClipboard().catch(e => console.error('[shortcut] pinyin failed', e));
-    })
-    : null;
-  console.log(`[shortcut] Ctrl+Shift+A=${ok1} Ctrl+Shift+D=${ok2}`);
+  const canLatch = watched === true;
+  if (!canLatch) {
+    console.warn('[shortcut] 拿不到 Control 按下/松开的只读观察 ⇒ latch 不可用(按住 Ctrl 连按会连着触发)');
+  }
+
+  const fire = (fn, name) => () => {
+    // 锁着 ⇒ 不触发(canLatch 为 false 时压根不碰 latch,维持旧行为)。
+    if (canLatch && !latch.tryFire()) {
+      shortcutStatus.latchArmed = latch.isArmed();
+      return;
+    }
+    shortcutStatus.latchArmed = latch.isArmed();
+    fn().catch(e => console.error(`[shortcut] ${name} failed`, e));
+  };
+
+  const ok1 = globalShortcut.register('Ctrl+S', fire(triggerDefaultExecute, 'default execute'));
+  const ok2 = globalShortcut.register('Ctrl+D', fire(triggerPinyinFromClipboard, 'pinyin'));
+
+  shortcutStatus.ctrlS = ok1 === true;
+  shortcutStatus.ctrlD = ok2 === true;
+  shortcutStatus.latchAvailable = canLatch;
+  shortcutStatus.latchArmed = latch.isArmed();
+  shortcutStatus.controlWatcherRunning = canLatch;
+
+  console.log(`[shortcut] Ctrl+S=${ok1} Ctrl+D=${ok2} latch=${canLatch}`);
 }
 
 // ── App Lifecycle ──

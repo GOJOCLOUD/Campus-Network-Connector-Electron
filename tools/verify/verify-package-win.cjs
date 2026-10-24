@@ -11,6 +11,8 @@
  *   2. 它能真正被加载并导出预期方法
  *   3. asar 内含运行必需文件(main.js / preload.js / dist / win-input/index.js)
  *   4. asar 内**不含** macOS 专属的东西(原生模块、参考库、算法源码、Tauri)
+ *   5. 把 asar 解出来真跑一遍(相对路径层级写错、文件漏打包当场暴露)
+ *   6. 包内**所有相对 require 都能解析** —— 这是"装上就崩"的根因(见下)
  *
  *   node tools/verify/verify-package-win.cjs [appDir]
  */
@@ -29,7 +31,10 @@ const APP_CANDIDATES = [
       .map((d) => path.join(releaseDir, d));
   })(),
 ].filter(Boolean);
-const APP = APP_CANDIDATES.find((p) => fs.existsSync(p)) || path.resolve(APP_CANDIDATES[0]);
+// 一个候选都没有时(本机没构建过 Windows 包)也要**友好报错**,
+// 而不是崩在 `path.resolve(undefined)` 那种看不出所以然的栈里。
+const APP = APP_CANDIDATES.find((p) => fs.existsSync(p))
+  || (APP_CANDIDATES[0] ? path.resolve(APP_CANDIDATES[0]) : path.resolve('release', 'win-unpacked'));
 const ASAR = path.join(APP, 'resources', 'app.asar');
 const UNPACKED = path.join(APP, 'resources', 'app.asar.unpacked');
 
@@ -56,7 +61,14 @@ check('原生模块已解包到 app.asar.unpacked', fs.existsSync(nodePath),
 if (fs.existsSync(nodePath)) {
   try {
     const binding = require(nodePath);
-    const need = ['mouseClick', 'sendText', 'sendKey', 'getCurrentInputSource'];
+    const need = [
+      'mouseClick', 'sendText', 'sendKey', 'getCurrentInputSource',
+      // 录制这一套:开始/停止/取/清/单条删除/刷新排除矩形
+      'startRecording', 'stopRecording', 'getRecordingClicks',
+      'clearRecordingClicks', 'removeRecordingClick', 'setExcludeRect',
+      // 快捷键 latch 的只读观察器(Control 按下/松开)
+      'watchControlKey',
+    ];
     const missing = need.filter((k) => typeof binding[k] !== 'function');
     check('原生模块可加载且导出预期方法', missing.length === 0,
       missing.length ? '缺少: ' + missing.join(',') : `(${Object.keys(binding).length} 个方法)`);
@@ -115,6 +127,117 @@ if (asarList === null) {
   check('asar 内不含文档系统', !asarList.some((f) => f.startsWith('/docs/')));
   check('asar 内不含开发脚本', !asarList.some((f) => f.startsWith('/tools/')));
   check('asar 内不含功能自测目录', !asarList.some((f) => f.startsWith('/src/features/') && f.includes('/test/')));
+}
+
+/**
+ * 把 asar 解到指定目录:优先用 @electron/asar 的 API,兜底走命令行。
+ *
+ * 兜底走命令行时**必须用 npx.cmd** —— Windows 上 npx 是 npx.cmd,
+ * 直接 spawn 'npx' 会 ENOENT(踩过:清单读不到 → 一堆检查假失败)。
+ */
+function extractAsar(asarPath, outDir) {
+  try {
+    const asar = require('@electron/asar');
+    if (typeof asar.extractAll === 'function') {
+      asar.extractAll(asarPath, outDir);
+      return;
+    }
+  } catch (_) { /* 走命令行兜底 */ }
+  const cli = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  execFileSync(cli, ['asar', 'extract', asarPath, outDir], {
+    encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+/**
+ * 相对 require 能不能在包里解析到。
+ *
+ * 依次试:原样 → 补 `.js` / `.cjs` / `.json` → 当目录找 `index.*`。
+ * 另外:解包到 `app.asar.unpacked` 的文件(原生模块)也算存在 ——
+ * asar 里只存占位,真文件在 unpacked 目录。
+ */
+function resolvesInside(fromFile, spec, root) {
+  const target = path.resolve(path.dirname(fromFile), spec);
+  const rel = path.relative(root, target);
+  const candidates = [
+    target,
+    target + '.js',
+    target + '.cjs',
+    target + '.json',
+    path.join(target, 'index.js'),
+    path.join(target, 'index.cjs'),
+    path.join(target, 'index.json'),
+  ];
+  if (rel && !rel.startsWith('..')) {
+    const unpacked = path.join(UNPACKED, rel);
+    candidates.push(unpacked, unpacked + '.js', path.join(unpacked, 'index.js'));
+  }
+  return candidates.some(c => {
+    try {
+      return fs.existsSync(c) && fs.statSync(c).isFile();
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
+// ⑤ 把 asar 解出来真跑一遍 + ⑥ 相对 require 的完整性
+//
+// ## 为什么必须有 ⑥
+//
+// electron-builder 的 `build.files` 是**白名单**:新加在仓库根目录的
+// `playback-guard.cjs` / `shortcut-latch.cjs` 没被写进白名单 ⇒ **没进包**
+// ⇒ `main.js` 顶层 `require(...)` 直接抛 ⇒ App **启动即崩**
+// (弹「A JavaScript error occurred in the main process」)。
+//
+// 而只看"asar 里有没有那几个文件"的检查**抓不到这一类** ——
+// 这就是 macOS 侧 ADR-0014 的第一层门禁:把整个包解开,
+// 把**每一个**相对 require 都解析一遍,解析不到就地报出来。
+{
+  const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cnc-win-verify-'));
+  try {
+    extractAsar(ASAR, tmp);
+    // 功能注册表是纯 JS —— 解包后能 require 就说明目录层级没写错。
+    try {
+      const reg = require(path.join(tmp, 'src/features/index.js'));
+      check('解包后功能注册表可加载', typeof reg.loadFeatures === 'function');
+    } catch (e) {
+      check('解包后功能注册表可加载', false, e.message);
+    }
+
+    // ⑥ 相对 require 的完整性
+    const missing = [];
+    let scanned = 0;
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        const rel = path.relative(tmp, full);
+        // 第三方依赖自己会解析(可选依赖常常没被打进去),不扫
+        if (rel.split(path.sep)[0] === 'node_modules') continue;
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!/\.(js|cjs|mjs)$/.test(entry.name)) continue;
+        scanned += 1;
+        const src = fs.readFileSync(full, 'utf-8');
+        // 只认**字面量**的相对 require;计算路径(require(变量))静态查不了,跳过
+        const re = /require\(\s*['"](\.[^'"]+)['"]\s*\)/g;
+        let m;
+        while ((m = re.exec(src)) !== null) {
+          if (!resolvesInside(full, m[1], tmp)) {
+            missing.push(`${rel.split(path.sep).join('/')} → ${m[1]}`);
+          }
+        }
+      }
+    };
+    walk(tmp);
+    check('包内所有相对 require 都能解析(装上不崩)', missing.length === 0,
+      missing.length
+        ? `缺 ${missing.length} 个: ${missing.slice(0, 6).join(' ; ')}`
+        : `(扫了 ${scanned} 个文件)`);
+  } catch (e) {
+    check('解包后能跑一遍相对 require 检查', false, e.message);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 console.log(failed === 0 ? '\n✔ 打包产物自检全部通过' : `\n✖ ${failed} 项不通过`);

@@ -1,8 +1,12 @@
 /**
  * 第 3 步:模拟点击(录制 / 回放),以及「管理录制文件」视图。
  *
- * 注意:**这个面板只在 macOS 上出现**。Windows 版没有录制能力(录制依赖 macOS 的
- * 事件监听),那一侧只保留「选择/管理录制文件 + 回放」,见 DefaultExecutePanel。
+ * Windows 线**也有录制**(`win-input` 的低级鼠标钩子 WH_MOUSE_LL),
+ * 所以这个面板在两边**行为一致**:
+ * - 录制期间实时显示点到的坐标;
+ * - 停止后每一条旁边有「×」可以**单条删除**(整条清空另有「清空」按钮);
+ * - 「点自己界面上的按钮不算一次点击」由**原生层**负责
+ *   (排除矩形按主进程手里的窗口位置算,窗口一动就刷新)。
  */
 import ManageFilesPanel from './ManageFilesPanel'
 
@@ -19,6 +23,7 @@ export default function ClickPanel({
   onManage,
   onSave,
   onClear,
+  onDeleteClick,
   jsonFiles,
   onRename,
   onDelete,
@@ -65,7 +70,18 @@ export default function ClickPanel({
                         <ul className="space-y-1 max-h-48 overflow-auto">
                           {clicks.map((click, index) => (
                             <li key={index} className="text-sm flex flex-col space-y-1">
-                              <span>第{index + 1}次: ({Math.round(click.x)}, {Math.round(click.y)})</span>
+                              <div className="flex items-center justify-between gap-2">
+                                <span>第{index + 1}次: ({Math.round(click.x)}, {Math.round(click.y)})</span>
+                                {/* 单条删除:点这个「×」只删这一条。
+                                    整条清空另有「清空」按钮(那个是全清)。 */}
+                                <button
+                                  type="button"
+                                  onClick={() => onDeleteClick(index)}
+                                  title={`删除第${index + 1}次点击`}
+                                  aria-label={`删除第${index + 1}次点击`}
+                                  className="shrink-0 rounded px-1 text-gray-400 transition hover:bg-gray-300 hover:text-red-500"
+                                >×</button>
+                              </div>
                               <input type="text"
                                 value={clickInputs[index] || ''}
                                 onChange={e => onClickInputChange(index, e.target.value)}

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -20,9 +21,36 @@ static DWORD g_hookThreadId = 0;
 static HHOOK g_hHook = nullptr;
 static std::atomic<bool> g_recording{false};
 static double g_recordingStartTime = 0;
-static bool g_hasExclude = false;
+static std::atomic<bool> g_hasExclude{false};
 static RECT g_excludeRect{};
+static std::mutex g_excludeMutex;
 static std::atomic<bool> g_hookFailed{false};
+
+// ── Control 观察器(快捷键 latch)─────────────────────────────────────────
+//
+// 只读观察 Control 的**按下/松开**边沿,喂给 `shortcut-latch.cjs` 的状态机
+// —— 与 macOS 侧的 CGEventTap(ListenOnly 事件 tap)同口径。
+//
+// ## 为什么用轮询 GetAsyncKeyState,而不是低级键盘钩子
+//
+// - `GetAsyncKeyState` 读的是**物理键盘状态**,**不受 `RegisterHotKey` 影响**
+//   ⇒ 组合键被别的程序抢走(系统热键 / 别的 App)时,照样拿得到 Control
+//   的真实按下与松开 —— latch 照样解得开。
+// - `WH_KEYBOARD_LL` 有 LowLevelHooksTimeout 风险:钩子回调一卡就被系统摘掉,
+//   而这个观察器**丢一次边沿就等于 latch 解不开**(用户再也触发不了快捷键)。
+// - 轮询间隔 25ms:用户松开 Control 之后几十毫秒内解锁,无感。
+//
+// ## 线程生命周期
+//
+// 停止 = `g_controlWatchStop` 标志 + join(在 env 清理钩子里做)
+// ⇒ 进程退出时不留野线程,也不会把 Node 事件循环吊住。
+static std::atomic<bool> g_controlWatchRunning{false};
+static std::atomic<bool> g_controlWatchStop{false};
+static std::atomic<bool> g_controlWatchReady{false};
+static std::mutex g_controlTsfnMutex;
+static Napi::ThreadSafeFunction g_controlTsfn;
+static std::mutex g_controlThreadMutex;
+static std::thread g_controlThread;
 
 // ── Low-Level Mouse Hook ─────────────────────────────────────────────────
 
@@ -32,9 +60,19 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
 
         POINT pt = info->pt;
 
-        if (g_hasExclude &&
-            pt.x >= g_excludeRect.left && pt.x <= g_excludeRect.right &&
-            pt.y >= g_excludeRect.top && pt.y <= g_excludeRect.bottom) {
+        // 排除矩形由**主进程**按当前窗口位置算,并且窗口一动就刷新
+        // (所以点自己界面上的按钮不算一次点击)。
+        // 读它要加锁:主进程随时可能在另一个线程上刷新它。
+        bool excluded = false;
+        {
+            std::lock_guard<std::mutex> lock(g_excludeMutex);
+            if (g_hasExclude &&
+                pt.x >= g_excludeRect.left && pt.x <= g_excludeRect.right &&
+                pt.y >= g_excludeRect.top && pt.y <= g_excludeRect.bottom) {
+                excluded = true;
+            }
+        }
+        if (excluded) {
             return CallNextHookEx(NULL, nCode, wParam, lParam);
         }
 
@@ -102,7 +140,15 @@ Napi::Value MouseClick(const Napi::CallbackInfo& info) {
     inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
     inputs[1].type = INPUT_MOUSE;
     inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(2, inputs, sizeof(INPUT));
+    // SendInput 返回**真正塞进去的事件数**;返回 0 = 一个都没进去
+    // (被系统拦下了:目标窗口权限更高、锁屏、会话切换……)。
+    //
+    // 这种情况下屏幕上什么都没发生 ⇒ 必须**如实报失败**,
+    // 否则上层会把它计成"执行了"(用户看到计数在涨,却什么都没发生)。
+    UINT inserted = SendInput(2, inputs, sizeof(INPUT));
+    if (inserted != 2) {
+        return env.Null();
+    }
 
     return Napi::Boolean::New(env, true);
 }
@@ -125,19 +171,22 @@ Napi::Value StartRecording(const Napi::CallbackInfo& info) {
         return MakeError(env, "already recording");
     }
 
-    g_hasExclude = false;
-    if (info.Length() >= 1 && info[0].IsArray()) {
-        auto arr = info[0].As<Napi::Array>();
-        if (arr.Length() == 4) {
-            double l = arr.Get(0u).As<Napi::Number>().DoubleValue();
-            double t = arr.Get(1u).As<Napi::Number>().DoubleValue();
-            double r = arr.Get(2u).As<Napi::Number>().DoubleValue();
-            double b = arr.Get(3u).As<Napi::Number>().DoubleValue();
-            g_excludeRect.left   = static_cast<LONG>(l);
-            g_excludeRect.top    = static_cast<LONG>(t);
-            g_excludeRect.right  = static_cast<LONG>(r);
-            g_excludeRect.bottom = static_cast<LONG>(b);
-            g_hasExclude = true;
+    {
+        std::lock_guard<std::mutex> lock(g_excludeMutex);
+        g_hasExclude = false;
+        if (info.Length() >= 1 && info[0].IsArray()) {
+            auto arr = info[0].As<Napi::Array>();
+            if (arr.Length() == 4) {
+                double l = arr.Get(0u).As<Napi::Number>().DoubleValue();
+                double t = arr.Get(1u).As<Napi::Number>().DoubleValue();
+                double r = arr.Get(2u).As<Napi::Number>().DoubleValue();
+                double b = arr.Get(3u).As<Napi::Number>().DoubleValue();
+                g_excludeRect.left   = static_cast<LONG>(l);
+                g_excludeRect.top    = static_cast<LONG>(t);
+                g_excludeRect.right  = static_cast<LONG>(r);
+                g_excludeRect.bottom = static_cast<LONG>(b);
+                g_hasExclude = true;
+            }
         }
     }
 
@@ -185,6 +234,50 @@ Napi::Value ClearRecordingClicks(const Napi::CallbackInfo& info) {
     std::lock_guard<std::mutex> lock(g_clickMutex);
     g_clicks.clear();
     return Napi::Boolean::New(info.Env(), true);
+}
+
+// 刷新排除矩形(左、上、右、下)。
+//
+// 「点自己界面上的按钮不算一次点击」靠它实现。矩形必须**跟着窗口走**:
+// 只能在开始录制时拍一张快照的话,窗口一动快照就过期了,点「结束」
+// 会被当成一次外部点击。所以主进程在窗口每次移动/变高时都调一次这个。
+Napi::Value SetExcludeRect(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    std::lock_guard<std::mutex> lock(g_excludeMutex);
+    g_hasExclude = false;
+    if (info.Length() >= 1 && info[0].IsArray()) {
+        auto arr = info[0].As<Napi::Array>();
+        if (arr.Length() == 4) {
+            double l = arr.Get(0u).As<Napi::Number>().DoubleValue();
+            double t = arr.Get(1u).As<Napi::Number>().DoubleValue();
+            double r = arr.Get(2u).As<Napi::Number>().DoubleValue();
+            double b = arr.Get(3u).As<Napi::Number>().DoubleValue();
+            g_excludeRect.left   = static_cast<LONG>(l);
+            g_excludeRect.top    = static_cast<LONG>(t);
+            g_excludeRect.right  = static_cast<LONG>(r);
+            g_excludeRect.bottom = static_cast<LONG>(b);
+            g_hasExclude = true;
+        }
+    }
+    return Napi::Boolean::New(env, true);
+}
+
+// 删掉第 index 次点击(单条删除)。返回有没有删掉。
+Napi::Value RemoveRecordingClick(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        return Napi::Boolean::New(env, false);
+    }
+    int64_t index = info[0].As<Napi::Number>().Int64Value();
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_clickMutex);
+        if (index >= 0 && static_cast<size_t>(index) < g_clicks.size()) {
+            g_clicks.erase(g_clicks.begin() + static_cast<ptrdiff_t>(index));
+            removed = true;
+        }
+    }
+    return Napi::Boolean::New(env, removed);
 }
 
 Napi::Value IsRecording(const Napi::CallbackInfo& info) {
@@ -545,6 +638,91 @@ Napi::Value SelectInputSource(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, reinterpret_cast<uintptr_t>(hkl) != 0);
 }
 
+// ── 快捷键 latch:观察 Control 的按下/松开 ────────────────────────────
+//
+// 回调参数:一个 JS 函数,收到 `true` = Control 按下、`false` = Control 松开。
+//
+// 返回 `true` = 只读观察起来了(latch 可用);
+// 返回 `false` = **没起来** ⇒ 调用方要**如实降级**
+// (没法做 latch,只能维持"按住 Ctrl 连按会连着触发"的旧行为)。
+//
+// 与 macOS 侧的 `watchControlKey` **同口径**(那边是 CGEventTap ListenOnly
+// 事件 tap;这边是 `GetAsyncKeyState` 轮询 + 边沿检测)。
+static void controlWatchThreadFunc() {
+    // 起始状态取"当前物理状态",不凭空造一个边沿。
+    bool prev = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    g_controlWatchReady.store(true);
+    while (!g_controlWatchStop.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        bool cur = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (cur == prev) continue;   // 没变化 ⇒ 不是边沿 ⇒ 不回调
+        prev = cur;
+        Napi::ThreadSafeFunction tsfn = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_controlTsfnMutex);
+            tsfn = g_controlTsfn;
+        }
+        if (tsfn) {
+            // NonBlocking:别在轮询线程上等 JS(队列是无界的,正常不会丢)。
+            tsfn.NonBlockingCall([cur](Napi::Env env, Napi::Function cb) {
+                cb.Call({Napi::Boolean::New(env, cur)});
+            });
+        }
+    }
+    g_controlWatchReady.store(false);
+}
+
+// 停掉观察线程(可重复调用)。
+//
+// **必须在 env 销毁之前**调用 —— 线程还在往 TSFN 上投递的话,
+// env 一销毁就是野指针(env 清理钩子里会做这件事)。
+static void stopControlWatch() {
+    g_controlWatchStop.store(true);
+    std::thread t;
+    {
+        std::lock_guard<std::mutex> lock(g_controlThreadMutex);
+        if (g_controlThread.joinable()) t = std::move(g_controlThread);
+    }
+    if (t.joinable()) t.join();
+    g_controlWatchRunning.store(false);
+    g_controlWatchReady.store(false);
+}
+
+Napi::Value WatchControlKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "watchControlKey 需要一个回调函数")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_controlTsfnMutex);
+        g_controlTsfn = Napi::ThreadSafeFunction::New(
+            env, info[0].As<Napi::Function>(), "control-watch", 0, 1);
+        // Unref:别让它挡住 Electron 事件循环退出
+        g_controlTsfn.Unref(env);
+    }
+    if (!g_controlWatchRunning.load()) {
+        g_controlWatchStop.store(false);
+        g_controlWatchReady.store(false);
+        g_controlWatchRunning.store(true);
+        std::lock_guard<std::mutex> lock(g_controlThreadMutex);
+        g_controlThread = std::thread(controlWatchThreadFunc);
+    }
+    // 等观察线程起来(最多 300ms)—— 起不来就**如实**告诉调用方,
+    // 别让它以为 latch 生效了。
+    for (int i = 0; i < 30 && !g_controlWatchReady.load(); i++) {
+        Sleep(10);
+    }
+    return Napi::Boolean::New(env, g_controlWatchReady.load());
+}
+
+// env 销毁前把观察线程停掉 —— 否则它会往一个已经销毁的 env 上投递。
+// (CleanupHook 的析构**不会**注销钩子,所以这里注册了就一直有效。)
+static void stopControlWatchOnEnvCleanup(void* /*data*/) {
+    stopControlWatch();
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -554,6 +732,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopRecording",       Napi::Function::New(env, StopRecording));
     exports.Set("getRecordingClicks",  Napi::Function::New(env, GetRecordingClicks));
     exports.Set("clearRecordingClicks",Napi::Function::New(env, ClearRecordingClicks));
+    exports.Set("setExcludeRect",      Napi::Function::New(env, SetExcludeRect));
+    exports.Set("removeRecordingClick",Napi::Function::New(env, RemoveRecordingClick));
     exports.Set("isRecording",         Napi::Function::New(env, IsRecording));
     exports.Set("tapFailed",           Napi::Function::New(env, TapFailed));
     exports.Set("sendText",            Napi::Function::New(env, SendText));
@@ -561,6 +741,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("sendKey",             Napi::Function::New(env, SendKey));
     exports.Set("getCurrentInputSource", Napi::Function::New(env, GetCurrentInputSource));
     exports.Set("selectInputSource",   Napi::Function::New(env, SelectInputSource));
+    exports.Set("watchControlKey",     Napi::Function::New(env, WatchControlKey));
+
+    // env 销毁前把观察线程停掉 —— 否则它会往一个已经销毁的 env 上投递。
+    // (CleanupHook 的析构**不会**注销钩子,所以这里注册了就一直有效。)
+    env.AddCleanupHook(&stopControlWatchOnEnvCleanup);
+
     return exports;
 }
 

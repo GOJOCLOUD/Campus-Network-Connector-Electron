@@ -33,10 +33,16 @@ contextBridge.exposeInMainWorld('cnc', {
   setCurrentAsInputSource(role) { return ipcRenderer.invoke('native:setCurrentAsInputSource', role); },
 
   // Recording
-  startRecording(excludeRect) { return ipcRenderer.invoke('native:startRecording', excludeRect); },
+  // 注意:开始录制**不传排除矩形** ——
+  // 「点自己界面上的按钮不算一次点击」由**原生层**负责:
+  // 排除矩形用主进程手里的窗口位置算,并且窗口每次移动/变高时刷新。
+  // 前端传的那份只是「开始那一刻」的一张快照,窗口一动就过期
+  // (点「结束」会被记成一次点击)。
+  startRecording() { return ipcRenderer.invoke('native:startRecording'); },
   stopRecording() { return ipcRenderer.invoke('native:stopRecording'); },
   getRecordingClicks() { return ipcRenderer.invoke('native:getRecordingClicks'); },
   clearRecordingClicks() { return ipcRenderer.invoke('native:clearRecordingClicks'); },
+  removeRecordingClick(index) { return ipcRenderer.invoke('native:removeRecordingClick', index); },
   isRecording() { return ipcRenderer.invoke('native:isRecording'); },
   tapFailed() { return ipcRenderer.invoke('native:tapFailed'); },
 

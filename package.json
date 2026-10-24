@@ -12,6 +12,7 @@
     "electron": "cross-env ELECTRON_RUN_AS_NODE= electron .",
     "electron:build": "npm run build && npm run build:win-native && cross-env ELECTRON_RUN_AS_NODE= electron .",
     "build:win-native": "node-gyp rebuild --directory=win-input",
+    "build:vendor": "node tools/build-vendor.mjs",
     "dist:win": "npm run build && npm run build:win-native && electron-builder --win --x64 --publish never",
     "pretest": "npm run build",
     "test": "node tools/verify/verify-ui-platforms.cjs",
@@ -74,7 +75,9 @@
       "win-input/**/*.node",
       "win-input/index.js",
       "src/features/index.js",
-      "package.json"
+      "package.json",
+      "playback-guard.cjs",
+      "shortcut-latch.cjs"
     ],
     "afterPack": "electron/after-pack.cjs",
     "win": {
