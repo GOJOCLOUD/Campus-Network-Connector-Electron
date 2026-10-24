@@ -120,15 +120,20 @@ Windows **没有「输入源」这个概念** ⇒ `sendText` 直接送 Unicode �
 | 「模拟点击(录制)」入口 | 有 | **不出现**(原生层有 `WH_MOUSE_LL` 的能力,但按 ADR-0012 不作为正式功能开放) | 平台必需 |
 | 「键盘输入(拼音自动键入)」入口 | 有 | **有** —— Windows 的 `sendText` 直接送 Unicode(WM_CHAR / KEYEVENTF_UNICODE),不依赖输入源切换 | **已对齐**(ADR-0012 明确 Windows 保留这一项) |
 | 「辅助功能」授权 | 需要,界面显示小问号 | **不需要**(SendInput 不需要授权) | 平台必需 |
-| 「辅助功能」小问号的写法 | `showAccessibilityBadge` 由 App 决定 | **显式传 `showAccessibilityBadge={false}`** | 形状一致,值不同 |
+| 「辅助功能」小问号的写法 | `showAccessibilityBadge: isMac` | `showAccessibilityBadge: isMac` | **逐字相同**(`isMac` 在 Windows 上恒为 `false` ⇒ 小问号不出现) |
+| 快捷键 / latch 的诊断字段 | `native:getStatus` 返回 5 栏(`shortcutCtrlS` / `shortcutCtrlD` / `latchAvailable` / `latchArmed` / `controlWatcherRunning`) | 同 5 栏,**同名同义** | **已对齐**(2026-10-24 把 mac 侧补齐) |
 | Safari 复制修复 | 有 | 无(无 Safari) | 平台必需 |
 | 输入源切换 | 有 | 无 | 平台必需 |
 | 录制 | CGEventTap | `WH_MOUSE_LL` 低级鼠标钩子 | 机制不同,行为一致 |
 | Control 边沿观察 | CGEventTap ListenOnly | `GetAsyncKeyState` 轮询 | 机制不同,行为一致 |
 
-**"显式"是什么意思**:Windows 侧**显式**传 `showAccessibilityBadge={false}`,
-而不是"没传那个 prop"。这样两个分支的 `App.jsx` 形状一致 ——
-以后有人加这个 prop 时,不会因为"Windows 没传"就以为那边不需要。
+**"显式"是什么意思**:Windows 侧**显式**写出这个形状(`showAccessibilityBadge: isMac`),
+而不是"没传那个 prop"。⇒ 两个分支的 `App.jsx` **逐字相同**
+(`isMac` 在 Windows 上恒为 `false`,所以小问号不出现 —— 值不同,写法相同)。
+
+> 2026-10-24 更正:本节原来写的是「Windows 侧显式传 `showAccessibilityBadge={false}`」。
+> 那是为了对齐**形状**临时写的字面量;现在两边统一成 `isMac`,
+> 两个分支的 `App.jsx` **逐字节相同** ⇒ 这一行不再是平台差异。
 
 ### 4.1 「完成」按钮:Windows 为什么也显示
 
