@@ -42,6 +42,20 @@ jobs:
       # 这套用例要读 vendor/page-guard.js(Electron 侧不入库、由 tools/build-vendor.mjs
       # 构建),所以先重建产物,测的才是**真正注入网页的那份**。
       - name: page-guard regression test
+
+      # 硬门禁:共享代码的两条不变量(跑不过就不发包)。
+      #
+      # ① 字形渲染的**栅格尺寸**必须与参考字形库一致 ——
+      #    不一致 ⇒ 送进匹配器的位图与库里的字形**错位** ⇒ 最近邻全是噪声
+      #    (实测落到「爫」「﹊」这类符号上,margin≈0)⇒ 永远判不出混淆
+      #    ⇒ 复制出来还是密文,**而且全程不报错**。
+      #    2026-10-25 实测踩过:渲染器 32×32、库 48×48。
+      #
+      # ② 扩展 ID 必须在 manifest / Rust / JS / 产物四处**算成同一个值** ——
+      #    算错 ⇒ 注册表写到一把**没人认的键**上 ⇒ 开关显示「已接管」,
+      #    浏览器里什么都没有(同样不报错)。
+      - name: Glyph grid + extension ID gates
+        run: node --test tools/verify/verify-glyph-grid.cjs tools/verify/verify-extension-id.cjs
         run: |
           npm run build:vendor
           node --test tools/verify/verify-page-guard.cjs
@@ -91,6 +105,20 @@ jobs:
       # 硬门禁:原生模块必须解包且能加载、引擎能从 asar 里跑起来。
       # 这条拦的是"装上之后功能是坏的"的老坑,见 ADR-0003。
       - name: Verify packaged app
+      # 硬门禁:浏览器修复扩展的**端到端**(跑不过就不发包)。
+      #
+      # 这是**唯一**能证明「网页上复制出来是明文」的用例 ——
+      # 2026-10-25「浏览器修复是失效的」就是它**没进 CI** 才漏出去的。
+      #
+      # 放在打包**之后**:扩展要用参考字形库,而那份库是 `build:vendor` 产出的
+      # (仓库里没入库 —— 太占地方)。它要真实 Chrome + 系统剪贴板 ⇒ 只能跑在
+      # macOS runner 上(Windows runner 的剪贴板在 session 0 里,读不到)。
+      - name: Chromium extension build + e2e test
+        shell: bash
+        run: |
+          node tools/build.mjs chromium
+          node --test tools/verify/verify-chromium-extension.cjs
+          npm run test:e2e
         run: node tools/verify/verify-package.cjs
 
       # 交付约定:统一出 zip,不再产出 dmg（体积一样,解压即用）。

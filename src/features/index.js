@@ -29,6 +29,19 @@ const FEATURES = [
     module: './safari-repair',
     platforms: ['darwin'],
   },
+  {
+    // Windows 线:同一个能力,但浏览器是 Chrome / Edge ⇒ 由扩展提供。
+    // 桌面程序**管得住**它:把扩展注册进浏览器的外部扩展清单(HKCU,
+    // 不需要开发者模式)⇒ 界面上是**一个开关**,和 mac 的那个一模一样。
+    //
+    // 用户 2026-10-25 原话:「Windows上我要和Mac一样的工作方式,
+    // 你别搞什么这种搞扩展这么复杂的操作,越简单越好,你为什么不照搬」。
+    id: 'chromium-repair',
+    title: '浏览器复制修复',
+    description: '把被网页字体混淆的文字还原成你看到的那句话',
+    module: './chromium-repair',
+    platforms: ['win32'],
+  },
 ];
 
 /**
