@@ -121,7 +121,7 @@ Windows **没有「输入源」这个概念** ⇒ `sendText` 直接送 Unicode �
 | 「键盘输入(拼音自动键入)」入口 | 有 | **有** —— Windows 的 `sendText` 直接送 Unicode(WM_CHAR / KEYEVENTF_UNICODE),不依赖输入源切换 | **已对齐**(ADR-0012 明确 Windows 保留这一项) |
 | 「辅助功能」授权 | 需要,界面显示小问号 | **不需要**(SendInput 不需要授权) | 平台必需 |
 | 「辅助功能」小问号的写法 | `showAccessibilityBadge: isMac` | `showAccessibilityBadge: isMac` | **逐字相同**(`isMac` 在 Windows 上恒为 `false` ⇒ 小问号不出现) |
-| 快捷键 / latch 的诊断字段 | `native:getStatus` 返回 5 栏(`shortcutCtrlS` / `shortcutCtrlD` / `latchAvailable` / `latchArmed` / `controlWatcherRunning`) | 同 5 栏,**同名同义** | **已对齐**(2026-10-24 把 mac 侧补齐) |
+| 快捷键 / latch 的诊断字段 | `native:getStatus` 返回 5 栏(`shortcutCtrlS` / `shortcutCtrlShiftD` / `latchAvailable` / `latchArmed` / `controlWatcherRunning`) | 同 5 栏,**同名同义** | **已对齐**(2026-10-24 把 mac 侧补齐) |
 | Safari 复制修复 | 有 | 无(无 Safari) | 平台必需 |
 | 输入源切换 | 有 | 无 | 平台必需 |
 | 录制 | CGEventTap | `WH_MOUSE_LL` 低级鼠标钩子 | 机制不同,行为一致 |

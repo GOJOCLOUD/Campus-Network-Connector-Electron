@@ -46,6 +46,27 @@ jobs:
           npm run build:vendor
           node --test tools/verify/verify-page-guard.cjs
 
+      # 硬门禁:浏览器修复扩展(复制修复)必须能构建出来(跑不过就不发包)。
+      #
+      # 2026-10-25 用户反馈:「在windows上那个把密文转化成明文的那个功能是失效的,
+      # 没有用的」—— 根因不是"没写":apps/chromium-extension/(MV3、自带字形库、
+      # 独立可运行)一直都在仓库里,是**两个 Windows 安装包里都没有它**
+      # ⇒ 那条能力在 Windows 上实际等于零。
+      #
+      # 桌面程序**接管不了浏览器**(Windows 上没有 Safari、没有 Apple Events,
+      # 没有能改写网页剪贴板事件的页面守卫通道)⇒ Windows 上的浏览器修复
+      # **就是这个扩展**:用户把它装进 Chrome/Edge,网页上复制出来才是明文。
+      #
+      # 这条门禁盯的是**产物真的齐、真的装得进去**:manifest 是合法 MV3、
+      # 三个脚本不是空壳、字形库能解开(坏 gzip ⇒ 扩展静默失能:
+      # 后台拿不到参考字形 ⇒ 还原不出明文 ⇒ 用户看到的就是"没反应")。
+      - name: Chromium extension build + verify
+        shell: bash
+        run: |
+          if [ ! -f vendor/glyph-db-48.crdb.gz ]; then npm run build:vendor; fi
+          npm run build:extension
+          node --test tools/verify/verify-chromium-extension.cjs
+
       # 界面层的回归需要**构建出来的 dist/**(真正装进 App 的那份前端),
       # 所以先单独构建一次 —— 下面的 dist:win 里也会再构建一次,
       # 重复的是那几十秒,换来的是"跑不过就不发包"这条门禁真的在打包**之前**。
@@ -121,6 +142,14 @@ jobs:
           path: release/**/*.exe
           if-no-files-found: error
 
+      # 只下了 .exe 的用户也得能拿到浏览器修复扩展 ⇒ 单独发一个附件。
+      # (桌面交付包 `模拟输入-Windows-全部.zip` 里也带了一份。)
+      - name: Pack Chromium extension for release
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist-core/chromium/*" -DestinationPath "browser-extension-chromium.zip" -Force
+          Write-Host "browser-extension-chromium.zip: $((Get-Item browser-extension-chromium.zip).Length) bytes"
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -135,4 +164,4 @@ jobs:
           $TITLE = "Windows build ${{ github.run_id }} (${{ github.ref_name }})"
           $NOTES_FILE = [System.IO.Path]::GetTempFileName()
           Set-Content -Path $NOTES_FILE -Value "Auto-built Windows exe. Branch: ${{ github.ref_name }}  Commit: ${{ github.sha }}" -Encoding UTF8
-          gh release create $TAG "$($EXE.FullName)" --title $TITLE --notes-file $NOTES_FILE --prerelease
+          gh release create $TAG "$($EXE.FullName)" "browser-extension-chromium.zip" --title $TITLE --notes-file $NOTES_FILE --prerelease

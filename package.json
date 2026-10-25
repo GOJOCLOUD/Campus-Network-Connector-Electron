@@ -13,6 +13,7 @@
     "electron:build": "npm run build && npm run build:win-native && cross-env ELECTRON_RUN_AS_NODE= electron .",
     "build:win-native": "node-gyp rebuild --directory=win-input",
     "build:vendor": "node tools/build-vendor.mjs",
+    "build:extension": "node tools/build.mjs chromium",
     "dist:win": "npm run build && npm run build:win-native && electron-builder --win --x64 --publish never",
     "pretest": "npm run build",
     "test": "node tools/verify/verify-ui-platforms.cjs",

@@ -205,14 +205,20 @@ async function probe(page) {
       check('Windows 第 2 步是「键盘输入」(拼音自动键入)',
         (await probe(page)).text.includes('键盘输入'));
 
-      // ── 右上角必须是**四个**按钮:最小化 / 最大化 / 关闭软件 / 放到后台 ──
+      // ── 右上角只留**两个**按钮:最小化 / 叉叉(=终止)──
       //
-      // 2026-10-25 用户口径:「你加一个最小化,加一个关闭,加一个最大化,
-      // 别他妈就只留小叉,让小叉变成放在后台,那不然人家真正想关软件还得点两次」。
+      // 2026-10-25 用户口径(第二次,最终版):「把全屏按钮给我删除掉,最小化保留,
+      // 然后叉叉也保留,你能不能搞个终止按钮,搞个叉车,两个就重复了呀,
+      // 现在就保留两个,一个最小化,一个终止,终止的形状要叉叉,其他的都不要」。
       //
-      // - **最小化** / **最大化**(再点一次还原);
-      // - **关闭软件** = 彻底退出(一次点击就退,不用先去托盘再点一次);
-      // - **小叉 = 放到后台**(窗口藏起来、进程留着,功能继续生效)。
+      // - **最小化**;
+      // - **叉叉** = **终止**(形状就是叉叉;彻底退出,一次点击就退)。
+      //
+      // 被删掉的三个(都是用户明令,不是我们自己猜的):
+      // - **最大化**(「把全屏按钮给我删除掉」);
+      // - **关闭软件**(电源图标)—— 与叉叉**重复**(用户原话「搞个叉车,两个就重复了呀」);
+      // - **放到后台** —— 窗口藏起来**仍然做得到**:Alt+F4 / 任务栏右键「关闭窗口」,
+      //   回来靠**托盘图标**(左键)或再运行一次程序。
       const corner = await page.evaluate(() => {
         const host = [...document.querySelectorAll('.app-nodrag')].find((d) => {
           const c = typeof d.className === 'string' ? d.className : '';
@@ -224,19 +230,17 @@ async function probe(page) {
           title: b.getAttribute('title') || '',
         }));
       });
-      check('Windows 右上角有 4 个按钮', corner && corner.length === 4,
+      check('Windows 右上角只有 2 个按钮', corner && corner.length === 2,
         corner ? corner.map((b) => b.aria).join(',') : '没找到右上角按钮组');
-      check('四个按钮是「最小化 / 最大化 / 关闭软件 / 放到后台」',
-        corner && corner.map((b) => b.aria).join(',') === '最小化,最大化,关闭软件,放到后台',
+      check('两个按钮是「最小化 / 终止(叉叉)」',
+        corner && corner.map((b) => b.aria).join(',') === '最小化,终止',
         corner ? corner.map((b) => b.aria).join(',') : '');
 
-      // 点这四个按钮,看它们各自调的是哪个窗口动作。
+      // 点这两个按钮,看它们各自调的是哪个窗口动作。
       //
-      // 关键两条:
-      // - 「**关闭软件**」必须调 **quit** —— 一次点击就真退出
-      //   (用户口径:「人家真正想关软件还得点两次」⇒ 不能让他先去托盘再点一次);
-      // - 「**放到后台**」(小叉)必须调 **hide** —— 窗口藏起来、进程留着
-      //   (用户口径:「要在后台挂着,功能依然生效」)⇒ 小叉**不是退出**。
+      // 关键:「**终止**」必须调 **quit** —— 一次点击就真退出
+      // (用户口径:「人家真正想关软件还得点两次」⇒ 不能让他先去托盘再点一次);
+      // **hide**(放到后台)**不该**再被右上角的按钮触发(那个按钮已按用户口径删掉)。
       await page.evaluate(() => {
         const host = [...document.querySelectorAll('.app-nodrag')].find((d) => {
           const c = typeof d.className === 'string' ? d.className : '';
@@ -245,12 +249,11 @@ async function probe(page) {
         [...host.querySelectorAll('button')].forEach((b) => b.click());
       });
       const calls = await page.evaluate(() => window.__winCalls);
-      check('四个按钮分别调 minimize / maximize / quit / hide',
-        JSON.stringify(calls) === JSON.stringify(['minimize', 'maximize', 'quit', 'hide']),
+      check('两个按钮分别调 minimize / quit',
+        JSON.stringify(calls) === JSON.stringify(['minimize', 'quit']),
         JSON.stringify(calls));
-      check('「放到后台」(小叉)调的是 hide(不是退出),「关闭软件」才是 quit',
-        calls.includes('hide') && calls.filter((c) => c === 'quit').length === 1,
-        JSON.stringify(calls));
+      check('右上角**没有**「放到后台」(hide)按钮了(用户明令删掉)',
+        !calls.includes('hide'), JSON.stringify(calls));
 
       // ── 「从剪贴板读入并键入」按钮**已经撤掉**(2026-10-25 用户口径)──
       //
@@ -373,13 +376,13 @@ async function probe(page) {
       await page.close();
     }
 
-    // ── Windows 线**只抢 ⌃D**,不抢 ⌃S(源码级断言)──
+    // ── Windows 线**只抢 ⌃⇧D**,不抢 ⌃S(源码级断言)──
     //
     // 2026-10-25 用户口径:「干脆直接把系统的抢了,我的软件优先级最高……
     // Ctrl 加 D 我发现在普通桌面它是退出软件的功能,那在使用这个的时候
-    // 没必要退出吧,所以就给他压制住」。
+    // 没必要退出吧,所以就给他压制住」+「你不要用ctrl+D了,直接ctrl+shift+D吧」。
     //
-    // - **⌃D** = 读剪贴板并键入 —— 我们抢的就是它(抢到手,别的软件就收不到);
+    // - **⌃⇧D** = 读剪贴板并键入 —— 我们抢的就是它(抢到手,别的软件就收不到);
     // - **⌃S** = 默认执行(回放)—— Windows 上那一屏**已经没有界面了**
     //   (ADR-0016),而 Ctrl+S 在别的软件里是「保存」⇒ **不抢**。
     //
@@ -388,18 +391,61 @@ async function probe(page) {
       const mainJs = fs.readFileSync(path.join(__dirname, '..', '..', 'main.js'), 'utf8');
       // 查的是**开关常量**:注册那条路一直在,开关决定它跑不跑。
       const switchOn = /const GLOBAL_SHORTCUTS_ENABLED\s*=\s*true/.test(mainJs);
-      check('Electron 的全局快捷键开关是**开**的(⌃D 要抢)',
+      check('Electron 的全局快捷键开关是**开**的(⌃⇧D 要抢)',
         switchOn,
         switchOn ? 'GLOBAL_SHORTCUTS_ENABLED = true' : '没找到 GLOBAL_SHORTCUTS_ENABLED = true');
-      // 注册的**键**必须只有 ⌃D。
-      const regD = /globalShortcut\.register\(\s*'Ctrl\+D'/.test(mainJs);
-      check('Electron 注册了 ⌃D(要抢的就是它)', regD, regD ? '' : "没找到 register('Ctrl+D')");
+      // 注册的**键**必须只有 ⌃⇧D。
+      const regD = /globalShortcut\.register\(\s*'Ctrl\+Shift\+D'/.test(mainJs);
+      check('Electron 注册了 ⌃⇧D(要抢的就是它)', regD, regD ? '' : "没找到 register('Ctrl+Shift+D')");
+      // **不能**还留着 ⌃D:用户明确要求换键(而且 ⌃D 在别的软件里是「退出」那一族)。
+      const regPlainD = /globalShortcut\.register\(\s*'Ctrl\+D'/.test(mainJs);
+      check('Electron **没有**再注册 ⌃D(用户口径:改用 ⌃⇧D)', !regPlainD,
+        regPlainD ? "居然还注册着 'Ctrl+D'" : '');
       const regS = /globalShortcut\.register\(\s*'Ctrl\+S'/.test(mainJs);
       check('Electron **没有**注册 ⌃S(默认执行:Windows 那屏已撤,且 Ctrl+S 是「保存」)',
         !regS, regS ? '居然注册了 Ctrl+S' : '');
       // 「抢没抢到」要能被界面读到 ⇒ 原生状态里必须有这一栏。
       check('原生状态里有「shortcutPasteRegistered」这一栏(界面靠它显示提示)',
         /shortcutPasteRegistered\s*:/.test(mainJs));
+    }
+
+    // ── 最后一页必须有**浏览器修复的说明块**(Windows 线)──
+    //
+    // 用户 2026-10-25:「在windows上那个把密文转化成明文的那个功能是失效的,
+    // 没有用的」「最后个页面的相关提示也和macOS上面的两个版本完全不同」。
+    //
+    // Windows 上的浏览器修复由 **Chrome/Edge 扩展**提供(桌面程序接管不了浏览器),
+    // 所以界面上给的是**说明块**而不是开关 —— 但**必须有**,
+    // 否则用户根本不知道这个功能在哪、怎么用 ⇒ 等于没有。
+    {
+      const page = await browser.newPage();
+      await page.evaluateOnNewDocument(stub('win32', { ok: true, platform: 'win32' }));
+      await page.goto(base, { waitUntil: 'networkidle0' });
+      await new Promise((r) => setTimeout(r, 600));
+      // 点到第 2 步(键盘输入)—— Windows 只有两步:激活 / 键盘输入
+      await page.evaluate(() => {
+        const circles = [...document.querySelectorAll('div')]
+          .filter((d) => typeof d.className === 'string'
+            && d.className.includes('h-8') && d.className.includes('w-8')
+            && d.className.includes('rounded-full'));
+        const target = circles[1];
+        if (target && target.parentElement) target.parentElement.click();
+      });
+      await new Promise((r) => setTimeout(r, 500));
+      const last = await probe(page);
+      check('Windows 最后一页有「浏览器修复(复制修复)」说明块',
+        last.text.includes('浏览器修复') && last.text.includes('复制修复'),
+        last.text.includes('浏览器修复') ? '' : last.text.slice(0, 200));
+      check('说明块说清楚了它由 Chrome / Edge 扩展提供',
+        /Chrome\s*\/\s*Edge|chrome:\/\/extensions/.test(last.text), '');
+      check('说明块给出了加载扩展的入口(chrome://extensions)',
+        last.text.includes('chrome://extensions'), '');
+      check('说明块告诉了用户扩展文件夹在哪儿(browser-extension)',
+        last.text.includes('browser-extension'), '');
+      // **不该**出现 mac 的「Safari 复制修复」开关(Windows 上没有 Safari)。
+      check('Windows 最后一页**没有** mac 的「Safari 复制修复」开关',
+        !last.text.includes('Safari 复制修复'), '');
+      await page.close();
     }
   } finally {
     await browser.close();
