@@ -796,7 +796,13 @@ ipcMain.handle('native:getStatus', async () => ({
   latchAvailable: shortcutStatus.latchAvailable,
   latchArmed: shortcutStatus.latchArmed,
   controlWatcherRunning: shortcutStatus.controlWatcherRunning,
-  globalShortcutsEnabled: false,
+  globalShortcutsEnabled: GLOBAL_SHORTCUTS_ENABLED,
+  // ⌃D **抢到了没有** —— 界面要用它显示提示。
+  //
+  // 抢不到 = 别的软件先注册了同一个组合键 ⇒
+  // 我们的 ⌃D **不会触发**,而目标软件自己的 Ctrl+D 也**照常生效**
+  // (所以那个软件还是会被它的「退出」关掉)⇒ 必须让用户知道。
+  shortcutPasteRegistered: shortcutStatus.ctrlD === true,
 }));
 
 ipcMain.handle('native:mouseClick', async (_e, x, y) => {
@@ -1079,23 +1085,29 @@ function createWindow() {
 
 // Windows 线**要不要注册全局快捷键**。
 //
-// ## 关着(2026-10-24 用户口径)
-//!
-//! - **⌃D 是 Windows 的系统默认键**。抢过来 ⇒ 用户在自己常用的软件里按 ⌃D,
-//!   那个软件/系统对话框会**直接被关掉**
-//!   (用户原话:「我不能设置为快捷键,不然他直接把软件退出了」)。
-//! - **⌃S 同为系统默认键**(「保存」),而且它驱动的「默认执行(回放)」在 Windows 上
-//!   **已经没有界面了**(上一轮按用户口径撤掉:「本来就没有这个功能」)
-//!   ⇒ 留着它就是一个**没有入口的隐藏功能**。
-//!
-//! 所以 Windows 线:**系统里不注册、窗口内也不拦** —— ⌃S / ⌃D 就是普通按键。
-//! 「读剪贴板并键入」这个能力**没丢**:搬到了「键盘输入」页的按钮上。
-//!
-//! 写成一个常量(而不是干脆删掉那条注册的路)是为了:
-//! ① 意图一眼可见,不用去翻注册代码;
-//! ② 门禁(`tools/verify/verify-ui-platforms.cjs`)能直接守着它;
-//! ③ 将来真要加全局键时,改成 true 并把键加进注册列表就行。
-const GLOBAL_SHORTCUTS_ENABLED = false;
+// ## 开着,而且**只抢 ⌃D**(2026-10-24 用户口径)
+//
+// 用户原话:「干脆直接把系统的抢了,我的软件优先级最高,这是最简单的办法,
+// 因为 Ctrl 加 D 我发现在普通桌面它是退出软件的功能,那在使用这个的时候
+// 没必要退出吧,所以说我就给他压制住」。
+//
+// - **抢 ⌃D(读剪贴板并键入)**:在普通 Windows 软件里,Ctrl+D 常常是
+//   「**退出软件**」那一族动作(菜单加速键)。我们自己注册成全局热键,
+//   别的软件就**收不到**它 ⇒ 模拟输入时按到它,那个软件**不会被关掉**。
+//
+//   能不能真抢到,取决于**谁先注册**:
+//   - 对方是**菜单加速键**(绝大多数软件的「退出」都是)⇒ 我们的
+//     `globalShortcut.register` 会**先于**它生效 ⇒ 稳赢;
+//   - 对方也注册了同一个组合键且**先注册** ⇒ 抢不到(系统不会让两个进程
+//     同时拥有同一个组合键)。
+//   ⇒ 所以「**抢没抢到必须告诉你**」:抢不到时界面要显示出来,
+//   不能让你以为「按了没反应」是系统的问题(见 `native:getStatus` 的
+//   `shortcutPasteRegistered` 与界面上的提示)。
+//
+// - **⌃S 不抢**:它驱动的是「默认执行(回放)」,而那一屏在 Windows 上
+//   **已经没有界面了**(ADR-0016)⇒ 抢了也没有东西可触发;
+//   而 Ctrl+S 在别的软件里是「**保存**」,抢过来会把人家的保存弄坏。
+const GLOBAL_SHORTCUTS_ENABLED = true;
 
 // 快捷键与 latch 的**诊断状态**。
 //
@@ -1116,6 +1128,15 @@ const shortcutStatus = {
   controlWatcherRunning: false,
 };
 
+// 「默认执行(回放)」的**实现本体**。
+//
+// ⚠️ **Windows 线上它现在没有入口**:⌃S **不抢**(Ctrl+S 在别的软件里是「保存」,
+// 抢过来会把人家的保存弄坏 —— 理由见 `GLOBAL_SHORTCUTS_ENABLED` 的注释),
+// 而「默认执行」那一屏在 Windows 上也**早就撤了**(ADR-0016)。
+// ⇒ 函数**留着**:将来真要加回 ⌃S,注册它就行,不用从头写。
+//
+// eslint 会报「定义了没用到」—— 这是**故意**的,不是漏网。
+// eslint-disable-next-line no-unused-vars
 async function triggerDefaultExecute() {
   let fileName = (selectedJsonSetting || '').trim();
   if (!fileName) {
@@ -1158,29 +1179,26 @@ async function triggerPinyinFromClipboard() {
 
 function registerShortcuts() {
   if (!GLOBAL_SHORTCUTS_ENABLED) {
-    // Windows 线**一个全局键都不占**(理由见 `GLOBAL_SHORTCUTS_ENABLED` 的注释)。
-    //
+    // 开关关着:一个全局键都不占。
     // 诊断字段(`shortcutCtrlS` / `shortcutCtrlD` / `latchAvailable` …)保留原样:
     // 它们现在是"恒为 false / 不适用",配合 `native:getStatus` 里的
-    // `globalShortcutsEnabled: false` 能一眼看出是**按政策不注册**,
-    // 而不是「注册失败」。
+    // `globalShortcutsEnabled` 能一眼看出是**按政策不注册**。
     shortcutStatus.ctrlS = false;
     shortcutStatus.ctrlD = false;
     shortcutStatus.latchAvailable = false;
     shortcutStatus.latchArmed = false;
     shortcutStatus.controlWatcherRunning = false;
-    console.log('[shortcut] Windows 线不注册任何全局快捷键(⌃D / ⌃S 是 Windows 的系统默认键)');
+    console.log('[shortcut] Windows 线不注册任何全局快捷键');
     return;
   }
 
-  // ── 下面这条是「真的要注册全局键」的路(当前开关是关的)──
+  // ── 下面这条是「真的注册全局键」的路 ──
   //
-  // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
+  // 快捷键:**⌃D** = 读剪贴板并键入(我们抢的就是它,理由见
+  // `GLOBAL_SHORTCUTS_ENABLED` 的注释)。
   //
-  // 与 mac 分支**同口径**(见本仓库 ADR-0013):
-  // - 只认 **Control**:不认 Win/Alt,也不要求 Shift(带 Shift 照样触发);
-  // - 两个快捷键**都要注册** —— Windows 上 ⌃D 现在真的做事
-  //   (读剪贴板 → `sendText` 逐字键入),不再是 macOS 专属。
+  // ⌃S(默认执行)**不注册**:Windows 上那一屏已经没有界面了,
+  // 而 Ctrl+S 在别的软件里是「保存」,抢过来会把人家的保存弄坏。
   //
   // ## latch(2026-10-23 用户要求)
   //
@@ -1188,8 +1206,7 @@ function registerShortcuts() {
   // > 除非下一次重新按住 Ctrl,再点击相应的字母」
   //
   // `globalShortcut` **只在按下时回调**,不告诉你 Control 什么时候松开 ⇒
-  // 靠它自己解不开 latch(按住 Ctrl 连按会连着触发;而「默认执行」是回放,
-  // 连着触发就是往屏幕上乱点)。
+  // 靠它自己解不开 latch(按住 Ctrl 连按会连着触发 ⇒ 剪贴板被键入好几遍)。
   // 所以另开一个**只读**观察看 Control 的按下/松开边沿:Control 一松开就重新武装。
   //
   // ## 规则(**Tauri 版 / mac 版同口径**;见 ADR-0013)
@@ -1200,7 +1217,7 @@ function registerShortcuts() {
   //
   // 最后一条是关键:系统热键的回调和只读观察的回调**谁先到不确定**。
   // 如果「Control 按下」那一下能把 latch 解开,用户按住 Ctrl 连按会连着
-  // 触发 —— 而「默认执行」是回放,触发多次就是往屏幕上乱点。
+  // 触发。
   //
   // ## Windows 上的只读观察怎么来的
   //
@@ -1235,16 +1252,21 @@ function registerShortcuts() {
     fn().catch(e => console.error(`[shortcut] ${name} failed`, e));
   };
 
-  const ok1 = globalShortcut.register('Ctrl+S', fire(triggerDefaultExecute, 'default execute'));
-  const ok2 = globalShortcut.register('Ctrl+D', fire(triggerPinyinFromClipboard, 'pinyin'));
+  // **只注册 ⌃D**。抢没抢到看返回值:抢不到 ⇒ 别的软件先注册了同一个组合键
+  // ⇒ 界面要把这件事显示出来(见 `native:getStatus` 的 `shortcutPasteRegistered`)。
+  const okD = globalShortcut.register('Ctrl+D', fire(triggerPinyinFromClipboard, 'pinyin'));
+  if (okD !== true) {
+    console.warn('[shortcut] ⌃D 没抢到(这个组合键被别的软件先注册了):'
+      + '按它不会触发我们,目标软件自己的 Ctrl+D 也会照常生效。');
+  }
 
-  shortcutStatus.ctrlS = ok1 === true;
-  shortcutStatus.ctrlD = ok2 === true;
+  shortcutStatus.ctrlS = false;
+  shortcutStatus.ctrlD = okD === true;
   shortcutStatus.latchAvailable = canLatch;
   shortcutStatus.latchArmed = latch.isArmed();
   shortcutStatus.controlWatcherRunning = canLatch;
 
-  console.log(`[shortcut] Ctrl+S=${ok1} Ctrl+D=${ok2} latch=${canLatch}`);
+  console.log(`[shortcut] Ctrl+D=${okD} latch=${canLatch}`);
 }
 
 // ── App Lifecycle ──
