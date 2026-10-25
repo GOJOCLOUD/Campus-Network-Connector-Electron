@@ -76,6 +76,7 @@
       "win-input/**/*.node",
       "win-input/index.js",
       "src/features/index.js",
+      "src/features/chromium-repair/**/*",
       "package.json",
       "playback-guard.cjs",
       "shortcut-latch.cjs"
@@ -85,6 +86,10 @@
       {
         "from": "build/win-icon.ico",
         "to": "win-icon.ico"
+      },
+      {
+        "from": "dist-core/chromium",
+        "to": "browser-extension"
       }
     ],
     "win": {

@@ -111,6 +111,10 @@ if (asarList === null) {
     '/preload.js',
     '/win-input/index.js',
     '/src/features/index.js',
+    // Windows 的「浏览器复制修复」模块 —— **少了它 require 就炸**,
+    // 功能整个加载不了 ⇒ 界面上根本不会出现那个开关。
+    '/src/features/chromium-repair/index.js',
+    '/src/features/chromium-repair/registry.js',
   ];
   for (const f of needFiles) {
     check(`asar 内含 ${f}`, asarList.includes(f));
@@ -139,6 +143,37 @@ if (asarList === null) {
   const trayIcon = path.join(APP, 'resources', 'win-icon.ico');
   check('托盘图标在包内(asar 外面:resources/win-icon.ico)', fs.existsSync(trayIcon),
     fs.existsSync(trayIcon) ? '' : '少了它 ⇒ 装上后没有托盘图标');
+}
+
+// ⑧ 浏览器修复扩展必须在包里(asar 外面)。
+//
+// Windows 的浏览器复制修复靠**扩展**:桌面程序把它注册进 Chrome/Edge 的
+// 外部扩展清单(HKCU)⇒ 扩展文件必须跟着安装包一起到电脑上。
+//
+// 少了它 ⇒ 开关会如实报「安装包里找不到浏览器修复扩展」——
+// 功能在,只是没法用。
+{
+  const extDir = path.join(APP, 'resources', 'browser-extension');
+  check('扩展目录在包内(resources/browser-extension)', fs.existsSync(extDir),
+    fs.existsSync(extDir) ? extDir : '少了它 ⇒ 开关会报「找不到扩展」');
+  if (fs.existsSync(extDir)) {
+    const manifestPath = path.join(extDir, 'manifest.json');
+    check('扩展 manifest 在', fs.existsSync(manifestPath));
+    if (fs.existsSync(manifestPath)) {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      // key 决定扩展 ID ⇒ 注册表键名。少了它 ⇒ 注册表写到一把没人认的键上。
+      check('扩展 manifest 带 key(扩展 ID 由它决定)', !!manifest.key);
+    }
+    for (const f of ['background.js', 'content-main.js', 'content-isolated.js']) {
+      const p = path.join(extDir, f);
+      const size = fs.existsSync(p) ? fs.statSync(p).size : 0;
+      check(`扩展脚本 ${f} 在且不是空壳`, size > 1024, `${size} 字节`);
+    }
+    const db = path.join(extDir, 'assets', 'glyph-db.crdb.gz');
+    const dbSize = fs.existsSync(db) ? fs.statSync(db).size : 0;
+    check('扩展自带字形库(没有它还原不出明文)', dbSize > 5 * 1024 * 1024,
+      `${(dbSize / 1024 / 1024).toFixed(1)} MB`);
+  }
 }
 
 /**
