@@ -783,12 +783,12 @@ ipcMain.handle('native:getStatus', async () => ({
   // 快捷键与 latch 的诊断字段(**与 win 分支同名字同含义**)。
   //
   // 排查「按了快捷键没反应」时按这个顺序看:
-  // ① ctrlS / ctrlD —— 热键**注册**成功没有(被别的 App 抢走就是 false);
+  // ① ctrlS / ctrlShiftD —— 热键**注册**成功没有(被别的 App 抢走就是 false);
   // ② latchAvailable / controlWatcherRunning —— Control 只读观察器在不在跑
   //    (不在跑 ⇒ latch 根本解不开,按住 Ctrl 连按会连着触发);
   // ③ latchArmed —— 当前是不是武装的(锁着就触发不了)。
   shortcutCtrlS: shortcutStatus.ctrlS,
-  shortcutCtrlD: shortcutStatus.ctrlD,
+  shortcutCtrlShiftD: shortcutStatus.ctrlShiftD,
   latchAvailable: shortcutStatus.latchAvailable,
   latchArmed: shortcutStatus.latchArmed,
   controlWatcherRunning: shortcutStatus.controlWatcherRunning,
@@ -1131,14 +1131,14 @@ function requestAccessibilityIfNeeded() {
  * 快捷键与 latch 的运行状态(诊断用)。
  *
  * **与 win 分支同名字、同含义** —— 两个平台的排查顺序一致:
- * ctrlS/ctrlD 看热键**注册**成没成,latchAvailable/controlWatcherRunning
+ * ctrlS/ctrlShiftD 看热键**注册**成没成,latchAvailable/controlWatcherRunning
  * 看 Control 只读观察器在不在跑,latchArmed 看当前能不能触发。
  */
 const shortcutStatus = {
   /** ⌃S(默认执行 = 回放)注册成功没有 */
   ctrlS: false,
-  /** ⌃D(剪贴板直输)注册成功没有 */
-  ctrlD: false,
+  /** ⌃⇧D(剪贴板直输)注册成功没有 */
+  ctrlShiftD: false,
   /** latch 可用吗(= Control 只读观察器起来了没有) */
   latchAvailable: false,
   /** 当前是不是武装的(诊断用) */
@@ -1148,11 +1148,11 @@ const shortcutStatus = {
 };
 
 function registerShortcuts() {
-  // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
+  // 快捷键:**⌃S** = 默认执行(回放)、**⌃⇧D** = 读剪贴板并键入。
   //
   // ## latch(2026-10-23 用户要求)
   //
-  // > 「触发之后 Ctrl+D 整个按键就不再会继续影响它了,
+  // > 「触发之后 Ctrl+Shift+D 整个按键就不再会继续影响它了,
   // > 除非下一次重新按住 Ctrl,再点击相应的字母」
   //
   // `globalShortcut` **只在按下时回调**,不告诉你 Control 什么时候松开 ⇒
@@ -1205,18 +1205,22 @@ function registerShortcuts() {
   const ok1 = globalShortcut.register('Ctrl+S', fire(triggerDefaultExecute, 'default execute'));
   // 剪贴板直输:macOS 这边多一步「切到 ASCII 输入源」(拼音键入需要),
   // Windows 没有「输入源」这个概念 ⇒ 那边靠 WM_CHAR 直接送字符。
-  // ⇒ **两个平台都注册 ⌃D**,「切输入源」那一步是 macOS 专有(ADR-0012 平台必需差异)。
+  // ⇒ **两个平台都注册 ⌃⇧D**,「切输入源」那一步是 macOS 专有(ADR-0012 平台必需差异)。
+  //
+  // ⚠️ **⌃⇧D**(2026-10-25 用户口径:「你不要用 ctrl+D 了,直接 ctrl+shift+D 吧」):
+  // (原来的 ⌃D 在普通软件里常常是「**退出软件**」那一族动作(菜单加速键),
+  //  抢它容易和别人打架 ⇒ 换成一个几乎没人用的组合键,抢到的概率高得多。)
   const ok2 = process.platform === 'darwin'
-    ? globalShortcut.register('Ctrl+D', fire(triggerPinyinFromClipboard, 'pinyin'))
+    ? globalShortcut.register('Ctrl+Shift+D', fire(triggerPinyinFromClipboard, 'pinyin'))
     : null;
 
   shortcutStatus.ctrlS = ok1 === true;
-  shortcutStatus.ctrlD = ok2 === true;
+  shortcutStatus.ctrlShiftD = ok2 === true;
   shortcutStatus.latchAvailable = canLatch;
   shortcutStatus.latchArmed = latch.isArmed();
   shortcutStatus.controlWatcherRunning = canLatch;
 
-  console.log(`[shortcut] Ctrl+S=${ok1} Ctrl+D=${ok2} latch=${canLatch}`);
+  console.log(`[shortcut] Ctrl+S=${ok1} Ctrl+Shift+D=${ok2} latch=${canLatch}`);
 }
 
 // ── App Lifecycle ──

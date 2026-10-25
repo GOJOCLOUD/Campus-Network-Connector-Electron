@@ -232,23 +232,27 @@ function App() {
     // 这里原本还会往屏幕最底下贴一条黑色调试条(显示按键信息)——
     // 那条带子已经删掉了(挡住屏幕底下的内容),但快捷键保留。
     const onKeyDown = (e) => {
-      // 快捷键:**⌃S** = 默认执行(回放)、**⌃D** = 读剪贴板并键入。
-      // 只认 **Control**:不认 Win/Alt,也不要求 Shift(带 Shift 照样触发)——
+      // 快捷键:**⌃S** = 默认执行(回放)、**⌃⇧D** = 读剪贴板并键入。
+      //
+      // 2026-10-25 用户口径:「你不要用 ctrl+D 了,直接 ctrl+shift+D 吧」
+      // ⇒ 剪贴板直入**必须带 Shift**。
+      //
+      // ⌃S 只认 **Control**:不认 Win/Alt,也不要求 Shift(带 Shift 照样触发)——
       // 两个平台**逐字一致**(见 ADR-0013)。
       //
-      // ⚠️ ⌃D 这一条在 **Windows 上不走这里**:Windows 线的 ⌃D 由**主进程的全局
+      // ⚠️ ⌃⇧D 这一条在 **Windows 上不走这里**:Windows 线的 ⌃⇧D 由**主进程的全局
       //   快捷键**接管(main.js 的 registerShortcuts:读剪贴板 → `sendText` 逐字键入)。
-      //   全局热键由系统吞掉按键,渲染进程**收不到** Ctrl+D 的 keydown
+      //   全局热键由系统吞掉按键,渲染进程**收不到** Ctrl+Shift+D 的 keydown
       //   ⇒ 不会两条路都触发(都触发 = 剪贴板内容被键入两遍)。
       //   这里的 `!isWindows` 两个平台保持一致 —— 别只改一边。
       //
-      //   (Windows 上「键盘输入」那一页是**手动**键入,和 ⌃D 的剪贴板直入
-      //   不是一回事:那页是用户自己敲内容,⌃D 是把剪贴板直接敲进去。)
+      //   (Windows 上「键盘输入」那一页是**手动**键入,和 ⌃⇧D 的剪贴板直入
+      //   不是一回事:那页是用户自己敲内容,⌃⇧D 是把剪贴板直接敲进去。)
       if (e.ctrlKey && e.code === 'KeyS') {
         e.preventDefault()
         defaultExecuteRef.current()
       }
-      if (e.ctrlKey && e.code === 'KeyD' && !isWindows) {
+      if (e.ctrlKey && e.shiftKey && e.code === 'KeyD' && !isWindows) {
         e.preventDefault()
         setMessage('读取剪贴板中...')
         setTimeout(() => setMessage(''), 2000)
