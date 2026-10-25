@@ -231,7 +231,8 @@ Tauri 的桥接层写的是 `Number(delaySeconds || 3)` —— `0 || 3` = **3**,
     `true` ⇒ 界面**没有**那条提示。
 - **源码级**:全局快捷键的开关是**开**的;注册的是 `Ctrl+D`;**没有**注册 `Ctrl+S`;
   原生状态里有 `shortcutPasteRegistered` 这一栏。
-- **latch**:`tools/verify/verify-shortcut-latch.cjs`(`node --test`,37 条)全绿。
+- **latch**:`tools/verify/verify-shortcut-latch.cjs` 等 6 个脚本
+  (`node --test`,共 37 条)全绿。
 - **macOS 线不变**:界面仍是 4 步、仍用原生红绿灯、仍注册 ⌃S / ⌃D。
 - 两线各跑各的自检,各发各的包;**一边的绿不替另一边背书**。
 - ⚠️ **Windows 真机行为仍未经真机验证**(本仓库的验证环境是 macOS)。

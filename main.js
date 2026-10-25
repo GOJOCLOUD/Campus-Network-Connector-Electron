@@ -787,10 +787,10 @@ ipcMain.handle('native:getStatus', async () => ({
   platform: process.platform,
   // 快捷键与 latch 的诊断字段(与 mac 分支的 `[shortcut]` 日志同口径)。
   //
-  // ⚠️ Windows 线**不注册任何全局快捷键**(2026-10-24 用户口径:⌃D 是 Windows 的
-  // 系统默认键,抢过来会让用户自己开的软件被直接关掉)⇒ 下面这一组字段
-  // 现在恒为 false / 不适用。`globalShortcutsEnabled: false` 就是用来
-  // 明确告诉排查的人:**这是按政策不注册,不是"注册失败"**。
+  // Windows 线**抢 ⌃D**(读剪贴板并键入),**不抢 ⌃S** —— 理由见
+  // `GLOBAL_SHORTCUTS_ENABLED` 的注释。
+  // ⇒ `shortcutCtrlD` = ⌃D 注册成功没有;`globalShortcutsEnabled` = 全局键这条路
+  // 是**开着**的;`shortcutPasteRegistered` = **抢到了没有**(界面靠它显示提示)。
   shortcutCtrlS: shortcutStatus.ctrlS,
   shortcutCtrlD: shortcutStatus.ctrlD,
   latchAvailable: shortcutStatus.latchAvailable,
@@ -1064,7 +1064,8 @@ function createWindow() {
   //
   // Windows 上直接退进程 = 把 app **关掉了**(不是"收起来")。
   // 这里改成**只隐藏窗口**:进程留着 ⇒ 托盘图标还在,还能把窗口叫回来。
-  // 彻底退出走**托盘菜单的「退出程序」**。
+  // 彻底退出有两个入口:右上角「关闭软件」按钮(`window:quit`)
+  // 或托盘菜单的「退出程序」。
   //
   // macOS 保持原样(红绿灯关窗口,App 留在 Dock,`activate` 再开一个)。
   mainWindow.on('close', (event) => {
@@ -1317,7 +1318,8 @@ app.on('window-all-closed', () => {
   // 「复制完全不修复」。Dock 图标还在，随时可以点回来开窗口。
   //
   // **Windows 线同口径**(2026-10-24 用户口径):关窗口只是把窗口**藏起来**,
-  // 进程留着(托盘图标还在)。这里**不退出** —— 真退出走托盘菜单的「退出程序」。
+  // 进程留着(托盘图标还在)。这里**不退出** —— 真退出有两个入口:
+  // 右上角「关闭软件」按钮(`window:quit`)或托盘菜单的「退出程序」。
   // (正常情况下这里根本不会触发:窗口的 close 被拦着,只是被 hide 了。
   //  真的走到这里 = 窗口是真的全没了,那才允许退出。)
   if (process.platform !== 'darwin') {
