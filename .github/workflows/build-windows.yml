@@ -61,7 +61,7 @@ jobs:
       # 之所以必须真跑浏览器:前面几环**静态检查抓不到** ——
       # 2026-10-26 的实测就抓到过「commands:['copy'] 不触发 DOM copy 事件」。
       - name: CDP copy-repair end-to-end gate
-        shell: pwsh
+        shell: bash
         run: |
           if [ ! -f vendor/page-guard.js ]; then npm run build:vendor; fi
           node --test tools/verify/verify-cdp-copy-repair.cjs
