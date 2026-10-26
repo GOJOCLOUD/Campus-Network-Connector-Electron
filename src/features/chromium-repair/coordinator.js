@@ -43,10 +43,9 @@ class CdpCoordinator {
    *   onWatch?:(urls:string[])=>void,
    * }} opts
    */
-  constructor({ log, browser, guardPath, frameBridgePath, siteFilter = [], onWatch = null } = {}) {
+  constructor({ log, browser, guardPath, frameBridgePath, onWatch = null } = {}) {
     this.log = log || (() => {});
     this.browser = browser;
-    this.siteFilter = siteFilter.map(String).filter(Boolean);
     this.onWatch = onWatch;
     this.guardSource = fs.readFileSync(guardPath, 'utf8');
     this.frameBridgeSource = fs.existsSync(frameBridgePath)
@@ -161,25 +160,47 @@ class CdpCoordinator {
     }
   }
 
-  /** 这一轮要处理哪些标签页 */
+  /**
+   * 这一轮要处理哪些标签页。
+   *
+   * ## 为什么是**全部**标签页,而不是只处理命中站点过滤的那些
+   *
+   * mac 侧只处理「前台标签 + 命中站点的标签 + 看住的标签」,因为在 Safari 上
+   * 一次 Apple Event 要 110ms,标签多了受不了。
+   * CDP 一次 `Runtime.evaluate` 往返只有毫秒级 ⇒ **全部标签页都轮询**更划算。
+   *
+   * 更重要的是**功能完整性**:
+   * 守卫在**每个**页面都装了(document_start 注入),它一发现混淆字体就会
+   * 把作用域挂到自己的 `state.pending` 上 —— 如果 App 不去读那个页面,
+   * 就永远发现不了这个字体、也就永远下发不了映射 ⇒ 那个页面上复制出来是密文。
+   * 只处理站点过滤命中的标签 ⇒ 这个缺口就存在(超星之外的混淆站点直接失效)。
+   *
+   * ⇒ 结论:Windows 线**不按站点过滤**,全部标签页都轮询。
+   * 「看住的标签」只用于**快轮询**(带混淆字体的标签,换题后要立刻跟上)。
+   */
   planJobs() {
     const jobs = [];
     const bridge = this.bridge;
     if (!bridge) return jobs;
     for (const tab of bridge.listTabs()) {
-      if (!this.siteFilter.length || this.siteFilter.some((f) => String(tab.url || '').includes(f))) {
-        jobs.push(tab.index);
-      }
+      jobs.push(tab.index);
     }
     return jobs;
   }
 
-  /** 快轮询：只处理带混淆字体的标签 */
+  /**
+   * 快轮询：只处理「带混淆字体的标签」。
+   *
+   * 用户换题后往往**立刻**选中复制，这一轮必须尽快把新字体的映射下发，
+   * 否则剪贴板里就是原始密文（mac 实测：换题后 1956ms 才正确）。
+   * 它独立于主轮次（不共用 running 标志），否则主轮次一圈会把快轮询饿死。
+   */
   async fastTick() {
     if (!this.enabled || this.fastRunning || !this.cipherTabs.size) return;
     this.fastRunning = true;
     try {
-      const bridge = await this.ensureBridge();
+      const bridge = this.bridge;
+      if (!bridge) return;
       for (const ordinal of [...this.cipherTabs.keys()]) {
         try {
           await this.processTab(ordinal);

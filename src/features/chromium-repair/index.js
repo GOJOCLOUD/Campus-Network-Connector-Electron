@@ -36,9 +36,6 @@ const { CdpCoordinator } = require('./coordinator');
 const { GlyphEngine } = require('../safari-repair/engine');
 const paths = require('../safari-repair/paths');
 
-/** 目标站点：这些站点的标签**始终**被接管，与是不是前台标签无关 */
-const SITE_FILTER = ['chaoxing.com'];
-
 /** 本功能在 settings.json 里的配置键（命名空间由注册表按功能 id 隔离） */
 const KEY_ENABLED = 'enabled';
 const KEY_WATCHED = 'watched';
@@ -66,7 +63,6 @@ function init({ log, settings, app } = {}) {
     browser,
     guardPath: paths.vendor('page-guard.js'),
     frameBridgePath: paths.vendor('frame-bridge.js'),
-    siteFilter: SITE_FILTER,
     onWatch: (urls) => settings?.set(KEY_WATCHED, urls),
   });
   coordinator.setEngine(

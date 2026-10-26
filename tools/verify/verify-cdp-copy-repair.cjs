@@ -118,7 +118,6 @@ test('CDP 注入守卫端到端：按 Ctrl+C 复制出来的是明文', { skip: 
     browser,
     guardPath: path.join(VENDOR, 'page-guard.js'),
     frameBridgePath: path.join(VENDOR, 'frame-bridge.js'),
-    siteFilter: [], // 夹具页不是超星 ⇒ 这里不靠站点过滤
   });
   coordinator.setEngine(new GlyphEngine({ log: (m) => console.log('   [engine]', m) }));
 
