@@ -74,6 +74,18 @@ await esbuild.build({
 });
 console.log('[vendor] common-charset.js');
 
+// 1d) 字体解析器
+//     引擎运行时是 `require(paths.vendor('opentype.js'))` —— 少了这个文件，
+//     引擎在**运行时**就抛 "Cannot find module"，整个 Safari 复制修复静默失效
+//     （安装包自检就是靠这条抓出来的）。所以它必须随包进 vendor/。
+const opentypeSrc = resolve(root, 'node_modules/opentype.js/dist/opentype.js');
+if (!existsSync(opentypeSrc)) {
+  console.error('[vendor] 找不到 opentype.js（node_modules/opentype.js/dist/opentype.js），先跑 npm install');
+  process.exit(1);
+}
+copyFileSync(opentypeSrc, resolve(out, 'opentype.js'));
+console.log('[vendor] opentype.js');
+
 // 3) 参考字形库（GBK 全集，gzip 分发）
 //    只带一套：Noto Sans SC 48×48。
 //    48×48 才能分清「国/固」这类方框字（32×32 实测会判不出）。

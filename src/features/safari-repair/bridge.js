@@ -17,6 +17,9 @@ const path = require('path');
 
 let tmpSeq = 0;
 
+/** "Safari 在不在"的缓存时长(ms)：够挡住高频轮询，又不至于反应太慢 */
+const RUNNING_CACHE_MS = 1200;
+
 /** 把 JS 源码里的非 ASCII 字符转成 \uXXXX 转义（保证注入内容是纯 ASCII）。 */
 function toAsciiJs(source) {
   // eslint-disable-next-line no-control-regex -- 非 ASCII 转义,控制字符范围是故意的
@@ -64,12 +67,36 @@ function runJsIn(target, js, { timeout = 5000 } = {}) {
 class SafariBridge {
   constructor({ log } = {}) {
     this.log = log || (() => {});
+    /** @type {{at:number, value:boolean}|null} */
+    this._runningCache = null;
   }
 
+  /**
+   * Safari 在不在运行。
+   *
+   * 这一问必须走 System Events：**任何 `tell application "Safari"` 在 Safari
+   * 没运行时都会把它启动起来** —— 而我们要的是"Safari 在跑就生效"，
+   * 不是"帮用户把 Safari 拉起来"。
+   *
+   * 结果缓存一小会儿：主轮询 300ms 一轮、每次问一遍会多出每秒好几个
+   * osascript 进程，白白拖慢整机。
+   */
   isRunning() {
+    const now = Date.now();
+    if (this._runningCache && now - this._runningCache.at < RUNNING_CACHE_MS) {
+      return Promise.resolve(this._runningCache.value);
+    }
     return osaAsync('tell application "System Events" to (name of processes) contains "Safari"', { timeout: 3000 })
-      .then((out) => out === 'true')
-      .catch(() => false);
+      .then((out) => {
+        const value = out === 'true';
+        this._runningCache = { at: now, value };
+        return value;
+      })
+      .catch(() => {
+        // 问不到（没权限）不等于没运行 → 按"在跑"处理，让上层去报真正的错误
+        this._runningCache = { at: now, value: true };
+        return true;
+      });
   }
 
   isFrontmost() {
@@ -100,19 +127,42 @@ class SafariBridge {
   /**
    * 一轮状态采集：**一次 Apple Event 拿到全部信息**。
    * 返回 { guard, pending, frames, unrepaired, collect }
+   *
+   * `resync: true` 时，先让页面里的守卫**把已知作用域重新报一遍**。
+   * App 刚启动时必须做：页面里还留着上一任 App 下发的映射，
+   * 守卫会以为"不用报" → App 永远学不到这个作用域 →
+   * 也就不会登记这个标签 → **快通道根本不盯它** →
+   * 换题之后只能等主通道那一圈（~1.2 秒），用户"换题立刻复制"就复制出密文。
+   *
+   * **必须走 bridge**：它把这一声喊到**所有 frame**——
+   * 真正带混淆字体的往往是嵌套 frame（学习通在第 3~4 层），
+   * 只喊顶层等于没喊（顶层通常压根没有自定义字体）。
+   *
+   * 顺序：必须在下面的 collect/take **之前** ——
+   * 这样重新报上来的作用域在**同一次** Apple Event 里就被收走。
    */
-  pollState({ tabIndex = null, windowIndex = null } = {}) {
+  pollState({ tabIndex = null, windowIndex = null, resync = false } = {}) {
     const target = this.target(tabIndex, windowIndex);
+    const resyncJs = resync
+      ? `try {
+        var rb = window.__copyRepairBridge;
+        if (rb && typeof rb.resync === 'function') { out.resync = rb.resync(); }
+        else if (typeof window.__copyRepairResync === 'function') { window.__copyRepairResync(); out.resync = 1; }
+      } catch (e) { }`
+      : '';
     const js = `(function(){
       var g = window.__copyRepairGuard;
       var out = {
         guard: !!g,
+        guardVersion: g ? (g.version || 0) : 0,
         pending: null,
         collect: 'none',
         frames: [],
         unrepaired: [],
+        resync: 0,
         url: String(location.href || ''),
       };
+      ${resyncJs}
       if (g) {
         if (window.__copyRepairCollect) {
           try { out.collect = String(window.__copyRepairCollect()); } catch (e) { out.collect = 'error'; }

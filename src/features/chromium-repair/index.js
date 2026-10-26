@@ -3,131 +3,145 @@
  *
  * 由 `src/features/index.js` 的注册表统一加载;新增功能照这个目录的形状做即可。
  *
- * 本功能负责:
- *   - 找到安装包里的 Chromium 扩展（复制修复用的那个）
- *   - 把它注册进 Chrome / Edge 的外部扩展清单（HKCU）
- *   - 关掉开关时把注册表那两把键删掉
+ * ## 它是怎么工作的(2026-10-26 起的形态)
  *
- * 与 mac 线的对应关系:
- *   mac  → `safari-repair`（Apple Events 驱动 Safari）
- *   win  → `chromium-repair`（注册表把扩展挂进 Chrome / Edge）
+ *   1. 用户拨一下开关 → **本软件自己起一个 Edge**(带自己的 profile 目录)
+ *   2. 通过 CDP 连上它,给**每个标签页**在 document_start 注入页面守卫
+ *      (`Page.addScriptToEvaluateOnNewDocument`)
+ *   3. 守卫发现页面里的混淆字体 → 上报给本软件
+ *   4. 本软件解析那个字体、和参考字形库比对,算出「密文 → 明文」映射
+ *   5. 映射下发回页面;用户按 Ctrl+C 时,守卫在 copy 事件里把明文写进剪贴板
  *
- * 界面上的**开关长得一模一样**（同一个前端组件、同一个位置）——
- * 差别只在背后接的是哪个浏览器（ADR-0013）。
+ * ## 为什么是「自己起浏览器」而不是「接管用户平时那个」
  *
- * 依赖 Windows；其它平台不支持（界面会自动隐藏开关）。
+ * Chromium ≥136 对默认 profile 直接忽略调试端口 ⇒ 想接管用户日常那个浏览器
+ * 就得改他的启动方式(那就不是零点击了)。自己起一个 ⇒ 零点击 + 绑定性满分,
+ * 代价是用户得在**这个**窗口里用、首次要扫码登录一次。
+ *
+ * ## 与 mac 线的对应关系
+ *
+ *   mac  → `safari-repair`(Apple Events 驱动 Safari)
+ *   win  → `chromium-repair`(CDP 驱动本软件自己起的 Edge)
+ *
+ * 界面上的**开关长得一模一样**(同一个前端组件、同一个位置)——
+ * 差别只在背后接哪个浏览器(ADR-0013)。
+ *
+ * 依赖 Windows;其它平台不支持(界面会自动隐藏开关)。
  */
-const registry = require('./registry');
+const path = require('path');
+const { ManagedBrowser } = require('./browser');
+const { CdpCoordinator } = require('./coordinator');
+// 字形还原引擎是**两条线共用**的一份实现(与 mac 线逐字相同),
+// 它只管「字体文件 → 密文/明文对照表」,与浏览器怎么驱动无关。
+const { GlyphEngine } = require('../safari-repair/engine');
+const paths = require('../safari-repair/paths');
+
+/** 目标站点：这些站点的标签**始终**被接管，与是不是前台标签无关 */
+const SITE_FILTER = ['chaoxing.com'];
 
 /** 本功能在 settings.json 里的配置键（命名空间由注册表按功能 id 隔离） */
 const KEY_ENABLED = 'enabled';
+const KEY_WATCHED = 'watched';
 
-/** 上一次失败的因 —— 界面必须把它露出来，
- *  否则用户只看到"已开启"却什么都没发生，根本无从判断是权限还是别的问题。 */
-let lastError = '';
-
-/** 记一次失败原因（空串 = 没有失败）。 */
-function setLastError(message) {
-  lastError = message || '';
-}
+let coordinator = null;
+let browser = null;
 
 /**
- * 注册（或注销）扩展。
- *
- * @param {boolean} enabled 开关
- * @returns {{ok: boolean, error?: string}}
+ * 界面上的提示文案 —— 必须说**确实会发生**的事：
+ * 本软件会开一个自己的浏览器窗口，用户要在那个窗口里用。
  */
-function apply(enabled) {
-  const dir = registry.findExtensionDir();
-  const manifest = dir ? registry.readManifest(dir) : null;
-  const id = registry.extensionId(manifest);
-  if (!id) {
-    const error = manifest
-      ? '扩展 manifest 缺少 key 字段，扩展 ID 算不出来'
-      : '安装包里找不到浏览器修复扩展（browser-extension 目录）';
-    setLastError(error);
-    return { ok: false, error };
-  }
-  const version = manifest.version || '0.1.0';
-  const errors = [];
-  for (const [browser, label] of registry.BROWSERS) {
-    const result = enabled
-      ? registry.registerBrowser(browser, id, dir, version)
-      : registry.unregisterBrowser(browser, id);
-    if (!result.ok) errors.push(`${label}: ${result.error}`);
-  }
-  if (errors.length) {
-    const error = errors.join('；');
-    setLastError(error);
-    return { ok: false, error };
-  }
-  setLastError('');
-  return { ok: true };
-}
+const HINT_ON =
+  '本软件已打开一个自己的 Edge 窗口 —— 请在这个窗口里上网、答题；' +
+  '关掉它后本软件会重新打开。首次使用需要扫码登录一次。';
 
-/**
- * 现在的状态 —— 界面靠它显示"已接管 / 关闭中 / 失败原因"。
- */
-function status(settings) {
-  const enabled = !!settings?.get(KEY_ENABLED, false);
-  const dir = registry.findExtensionDir();
-  const manifest = dir ? registry.readManifest(dir) : null;
-  const id = registry.extensionId(manifest);
-  const registered = id ? registry.registeredBrowsers(id) : [];
-  const running = registry.browsersRunning();
-  let hint = '';
-  if (enabled && registered.length) {
-    hint = running.length
-      ? `已注册到 ${registered.join('、')}，但浏览器正在运行 —— 请重启一次浏览器后生效。`
-      : `已注册到 ${registered.join('、')}，下次打开浏览器即生效。`;
-  }
-  return {
-    enabled,
-    supported: process.platform === 'win32',
-    injected: registered.length > 0,
-    registered,
-    browsersRunning: running,
-    hint,
-    lastError,
-  };
-}
-
-function init({ settings } = {}) {
-  // 恢复上次的开关状态:把注册表那两把键**重写一遍**。
-  //
-  // 为什么每次启动都要写:注册表里的 `path` 指向安装目录里的扩展 ——
-  // 用户把程序挪了位置(或换了机器重新装),那把键就指着旧路径 ⇒
-  // 浏览器启动时找不到扩展 ⇒ 开关显示"已开启"但什么都没发生。
-  // 每次启动重写一次 = 自愈,不用用户做任何事。
+function init({ log, settings, app } = {}) {
+  if (coordinator) return coordinator;
+  const userData = app && app.getPath ? app.getPath('userData') : path.join(process.cwd(), '.cnc-userdata');
+  browser = new ManagedBrowser({
+    profileDir: path.join(userData, 'browser-profile'),
+    log: (m) => log?.(`[chromium-repair] ${m}`),
+  });
+  coordinator = new CdpCoordinator({
+    log: (m) => log?.(`[chromium-repair] ${m}`),
+    browser,
+    guardPath: paths.vendor('page-guard.js'),
+    frameBridgePath: paths.vendor('frame-bridge.js'),
+    siteFilter: SITE_FILTER,
+    onWatch: (urls) => settings?.set(KEY_WATCHED, urls),
+  });
+  coordinator.setEngine(
+    new GlyphEngine({
+      log: (m) => log?.(`[chromium-repair] ${m}`),
+    }),
+  );
+  // 恢复上次的开关状态
   if (settings?.get(KEY_ENABLED, false)) {
-    apply(true);
+    coordinator.setEnabled(true);
   }
-  return { apply, status: () => status(settings) };
+  return coordinator;
+}
+
+function get() {
+  return coordinator;
+}
+
+/** 现在的状态 —— 界面靠它显示"已接管 / 关闭中 / 失败原因"。 */
+function status() {
+  if (!coordinator) {
+    return { enabled: false, running: false, supported: true, injected: false, hint: '', lastError: '' };
+  }
+  const state = coordinator.getStatus();
+  return {
+    ...state,
+    supported: true,
+    // 界面把「浏览器没开」当中性状态处理；Windows 线上是**我们自己开的**浏览器，
+    // 所以这里不暴露 safariRunning 那个字段（那是 mac 线的口径）。
+    hint: state.enabled ? HINT_ON : '',
+  };
 }
 
 /** 注册 IPC（命名遵循项目既有约定：模块:动作）。 */
 function registerIpc(ipcMain, { settings } = {}) {
-  ipcMain.handle('chromiumRepair:getStatus', async () => status(settings));
+  ipcMain.handle('chromiumRepair:getStatus', async () => status());
 
   ipcMain.on('chromiumRepair:setEnabled', (_e, enabled) => {
-    apply(!!enabled);
+    if (!coordinator) return;
+    coordinator.setEnabled(!!enabled);
   });
 
   ipcMain.on('chromiumRepair:setEnabledSetting', (_e, enabled) => {
     settings?.set(KEY_ENABLED, !!enabled);
   });
+
+  ipcMain.handle('chromiumRepair:checkNow', async () => {
+    if (!coordinator) return { action: 'not-initialized' };
+    return coordinator.tick();
+  });
 }
 
 function dispose() {
-  /* 注册表里的键**不主动删** —— 用户关了应用不等于要关掉这个功能。 */
+  try {
+    coordinator?.stop();
+  } catch (_) {
+    /* ignore */
+  }
+  // 只断连接，**不关浏览器**：那个窗口现在是用户的窗口了。
+  try {
+    browser?.disconnect();
+  } catch (_) {
+    /* ignore */
+  }
+  coordinator = null;
+  browser = null;
 }
 
 module.exports = {
   id: 'chromium-repair',
   title: '浏览器复制修复',
   init,
+  get,
   registerIpc,
   dispose,
-  apply,
   status,
+  CdpCoordinator,
 };

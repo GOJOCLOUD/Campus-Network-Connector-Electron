@@ -114,7 +114,21 @@ if (asarList === null) {
     // Windows 的「浏览器复制修复」模块 —— **少了它 require 就炸**,
     // 功能整个加载不了 ⇒ 界面上根本不会出现那个开关。
     '/src/features/chromium-repair/index.js',
-    '/src/features/chromium-repair/registry.js',
+    '/src/features/chromium-repair/cdp.js',
+    '/src/features/chromium-repair/browser.js',
+    '/src/features/chromium-repair/cdp-bridge.js',
+    '/src/features/chromium-repair/coordinator.js',
+    // 字形还原引擎:两条线共用的一份(Windows 线直接 require 它)
+    '/src/features/safari-repair/engine.js',
+    '/src/features/safari-repair/fast-matcher.js',
+    '/src/features/safari-repair/paths.js',
+    // 运行时依赖(页面守卫 / 帧桥 / 共享核心 / 字体解析器 / 参考字形库)
+    '/vendor/page-guard.js',
+    '/vendor/frame-bridge.js',
+    '/vendor/copy-repair-core.cjs',
+    '/vendor/common-charset.js',
+    '/vendor/opentype.js',
+    '/vendor/glyph-db-48.crdb.gz',
   ];
   for (const f of needFiles) {
     check(`asar 内含 ${f}`, asarList.includes(f));
@@ -122,9 +136,11 @@ if (asarList === null) {
   check('asar 内含前端产物', asarList.some((f) => f.startsWith('/dist/') && f.endsWith('index.html')));
 
   // ④ Windows 包里**不该有** macOS 的东西
+  //
+  // 注意:vendor/ 与 safari-repair/{engine,fast-matcher,paths}.js **是要进的** ——
+  // 前者是浏览器复制修复的运行时依赖(页面守卫/帧桥/共享核心/字体解析器/参考库),
+  // 后者是两条线共用的字形还原引擎(只取这三个文件,Safari 那套不带)。
   check('asar 内不含 macOS 原生模块', !asarList.some((f) => f.startsWith('/mac-coregraphics/')));
-  check('asar 内不含参考库 vendor/', !asarList.some((f) => f.startsWith('/vendor/')));
-  check('asar 内不含 Safari 修复模块', !asarList.some((f) => f.startsWith('/src/features/safari-repair/')));
   check('asar 内不含算法源码 packages/', !asarList.some((f) => f.startsWith('/packages/')));
   check('asar 内不含浏览器扩展 apps/', !asarList.some((f) => f.startsWith('/apps/')));
   check('asar 内不含 Tauri 源码', !asarList.some((f) => f.startsWith('/tauri-app/')));
@@ -145,34 +161,29 @@ if (asarList === null) {
     fs.existsSync(trayIcon) ? '' : '少了它 ⇒ 装上后没有托盘图标');
 }
 
-// ⑧ 浏览器修复扩展必须在包里(asar 外面)。
+// ⑧ 浏览器复制修复的**运行时依赖**必须齐全。
 //
-// Windows 的浏览器复制修复靠**扩展**:桌面程序把它注册进 Chrome/Edge 的
-// 外部扩展清单(HKCU)⇒ 扩展文件必须跟着安装包一起到电脑上。
-//
-// 少了它 ⇒ 开关会如实报「安装包里找不到浏览器修复扩展」——
-// 功能在,只是没法用。
+// 2026-10-26 起 Windows 线改成「软件自己起浏览器 + CDP 注入页面守卫」，
+// **不再需要浏览器扩展**（扩展已退役）。但页面侧那套仍然要用：
+//   vendor/page-guard.js         注入网页的页面守卫
+//   vendor/frame-bridge.js        顶层桥（把同源 iframe 串起来）
+//   vendor/copy-repair-core.cjs   共享核心（Node 侧做字形匹配）
+//   vendor/opentype.js            字体解析器
+//   vendor/glyph-db-48.crdb.gz    参考字形库
+// 少了任何一个 ⇒ 开关会如实报错，或还原不出明文。
+// （体积检查在下面解包之后做 —— asar 里的文件大小要解出来才看得到。）
 {
-  const extDir = path.join(APP, 'resources', 'browser-extension');
-  check('扩展目录在包内(resources/browser-extension)', fs.existsSync(extDir),
-    fs.existsSync(extDir) ? extDir : '少了它 ⇒ 开关会报「找不到扩展」');
-  if (fs.existsSync(extDir)) {
-    const manifestPath = path.join(extDir, 'manifest.json');
-    check('扩展 manifest 在', fs.existsSync(manifestPath));
-    if (fs.existsSync(manifestPath)) {
-      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-      // key 决定扩展 ID ⇒ 注册表键名。少了它 ⇒ 注册表写到一把没人认的键上。
-      check('扩展 manifest 带 key(扩展 ID 由它决定)', !!manifest.key);
-    }
-    for (const f of ['background.js', 'content-main.js', 'content-isolated.js']) {
-      const p = path.join(extDir, f);
-      const size = fs.existsSync(p) ? fs.statSync(p).size : 0;
-      check(`扩展脚本 ${f} 在且不是空壳`, size > 1024, `${size} 字节`);
-    }
-    const db = path.join(extDir, 'assets', 'glyph-db.crdb.gz');
-    const dbSize = fs.existsSync(db) ? fs.statSync(db).size : 0;
-    check('扩展自带字形库(没有它还原不出明文)', dbSize > 5 * 1024 * 1024,
-      `${(dbSize / 1024 / 1024).toFixed(1)} MB`);
+  const vendorNeed = [
+    'page-guard.js',
+    'frame-bridge.js',
+    'copy-repair-core.cjs',
+    'common-charset.js',
+    'opentype.js',
+    'glyph-db-48.crdb.gz',
+  ];
+  for (const f of vendorNeed) {
+    const p = `/vendor/${f}`;
+    check(`asar 内含运行时依赖 ${p}`, asarList ? asarList.includes(p) : false);
   }
 }
 
@@ -250,6 +261,23 @@ function resolvesInside(fromFile, spec, root) {
       check('解包后功能注册表可加载', typeof reg.loadFeatures === 'function');
     } catch (e) {
       check('解包后功能注册表可加载', false, e.message);
+    }
+
+    // ⑧ 运行时依赖的**体积**：空壳文件等于功能静默失能
+    {
+      const sizeOf = (rel) => {
+        const p = path.join(tmp, rel);
+        return fs.existsSync(p) ? fs.statSync(p).size : 0;
+      };
+      const guardSize = sizeOf('vendor/page-guard.js');
+      check('页面守卫不是空壳(注入的就是它)', guardSize > 4 * 1024, `${guardSize} 字节`);
+      const bridgeSize = sizeOf('vendor/frame-bridge.js');
+      check('帧桥不是空壳(同源 iframe 靠它)', bridgeSize > 1024, `${bridgeSize} 字节`);
+      const dbSize = sizeOf('vendor/glyph-db-48.crdb.gz');
+      check('参考字形库在(没有它还原不出明文)', dbSize > 5 * 1024 * 1024,
+        `${(dbSize / 1024 / 1024).toFixed(1)} MB`);
+      const otSize = sizeOf('vendor/opentype.js');
+      check('字体解析器在(少了它 require 直接抛)', otSize > 100 * 1024, `${(otSize / 1024).toFixed(0)} KB`);
     }
 
     // ⑥ 相对 require 的完整性

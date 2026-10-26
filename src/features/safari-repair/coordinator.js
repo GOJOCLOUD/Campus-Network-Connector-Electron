@@ -22,7 +22,7 @@ const { SafariBridge } = require('./bridge');
 const { GlyphEngine } = require('./engine');
 
 const DEFAULT_INTERVAL_MS = 300;
-const MAX_BACKOFF_MS = 15000;
+const MAX_BACKOFF_MS = 4000;
 /** 每隔几轮复查一次"被看住的标签" */
 const WATCH_EVERY_ROUNDS = 10;
 /** 每隔几轮处理一次"命中目标站点"的标签 */
@@ -41,6 +41,21 @@ const FORCE_INJECT_EVERY = 5;
  */
 const CIPHER_TAB_POLL_MS = 200;
 
+/**
+ * 「看住的标签」和「已喊过重报」这两张表**统一的键**。
+ *
+ * 之前有三套写法并存：'front' / `w{windowIndex}t{tabIndex}` / String(index)，
+ * 而读表的时候用的是**裸数字**的 tabIndex → 永远取不到 →
+ * 计数永远不累加 → **强制重注入从不发生** →
+ * 页面里旧版守卫也就永远换不掉（守卫自己会按版本号就地升级，但没人重新注入它）。
+ *
+ * 键必须只有一种写法，否则「记下来的」和「取出来的」不是同一把钥匙。
+ */
+function tabKey(tabIndex, windowIndex = null) {
+  if (tabIndex === null || tabIndex === undefined) return 'front';
+  return windowIndex ? `w${windowIndex}t${tabIndex}` : String(tabIndex);
+}
+
 class InjectorCoordinator {
   constructor({ log, intervalMs, guardPath, dbPath, targetTabIndex = null, onWatch = null, siteFilter = [] } = {}) {
     this.log = log || (() => {});
@@ -51,6 +66,20 @@ class InjectorCoordinator {
       guardPath || paths.vendor('page-guard.js'),
       'utf8',
     );
+    /**
+     * 我们要注入的这份守卫是**第几版**。
+     *
+     * 页面里可能留着**上一任 App 注入的旧版守卫** —— 守卫自己会按版本号就地升级，
+     * 但前提是**有人重新注入它**。Electron 侧以前只在"守卫不在"时注入，
+     * 于是旧版守卫能一直赖着（2026-10-23 的偏差：ticksSinceInject 的计数从来没生效，
+     * 强制重注入从不发生）。现在两个口子都堵上：
+     * ① 版本对不上 → 立刻重注入；② 看住的标签每 FORCE_INJECT_EVERY 轮也重注入一次。
+     *
+     * 版本号从注入源里读（打包后是 `var GUARD_VERSION = 10;`）；
+     * 读不到就退化成"只靠周期性重注入"，不猜。
+     */
+    const versionMatch = /GUARD_VERSION\s*=\s*(\d+)/.exec(this.guardSource);
+    this.guardVersion = versionMatch ? Number(versionMatch[1]) : null;
     const frameBridgePath = paths.vendor('frame-bridge.js');
     this.frameBridgeSource = existsSync(frameBridgePath)
       ? fs.readFileSync(frameBridgePath, 'utf8')
@@ -75,6 +104,8 @@ class InjectorCoordinator {
     this.loggedReasons = new Set();
     /** 带混淆字体的标签（key -> {tabIndex, windowIndex, url}），走快轮询 */
     this.cipherTabs = new Map();
+    /** 已经喊过"重报"的标签（每个标签只喊一次）：key = 标签标识 */
+    this.resyncedTabs = new Set();
     /** 快轮询的定时器 */
     this.fastTimer = null;
     this.fastRunning = false;
@@ -124,7 +155,10 @@ class InjectorCoordinator {
     this.startFastPoll();
     this.timer = setInterval(() => {
       this.tick().catch((error) => {
-        this.state.lastError = String(error && error.message ? error.message : error);
+        const message = String(error && error.message ? error.message : error);
+        this.state.lastError = message;
+        // 也要进主进程日志:打包版没有终端可看,日志是唯一能远程核对的地方
+        this.log('Safari 修复失败:' + message);
       });
     }, this.intervalMs);
     if (this.timer.unref) this.timer.unref();
@@ -143,12 +177,7 @@ class InjectorCoordinator {
 
   /** 登记一个"出现过混淆字体"的标签，之后持续看住它 */
   watchTab(tabIndex, url, windowIndex = null) {
-    const key =
-      tabIndex === null || tabIndex === undefined
-        ? 'front'
-        : windowIndex
-          ? `w${windowIndex}t${tabIndex}`
-          : String(tabIndex);
+    const key = tabKey(tabIndex, windowIndex);
     const existing = this.watched.get(key);
     if (existing && existing.url === url) return;
     this.watched.set(key, { url: url || '', ticksSinceInject: 0, tabIndex, windowIndex });
@@ -177,7 +206,7 @@ class InjectorCoordinator {
       if (!url) continue;
       const index = await this.bridge.findTabByUrl(url);
       if (index > 0) {
-        this.watched.set(String(index), { url, ticksSinceInject: 0, tabIndex: index, windowIndex: null });
+        this.watched.set(tabKey(index, null), { url, ticksSinceInject: 0, tabIndex: index, windowIndex: null });
       }
     }
     this.state.watchedTabs = this.watched.size;
@@ -229,6 +258,11 @@ class InjectorCoordinator {
     if (!this.enabled || this.fastRunning || !this.cipherTabs.size) return;
     this.fastRunning = true;
     try {
+      // 同上:Safari 没开就别去碰它(否则会被 Apple Event 启动)
+      const safariRunning = await this.bridge.isRunning();
+      this.state.safariRunning = safariRunning;
+      if (!safariRunning) return;
+
       for (const [key, info] of [...this.cipherTabs]) {
         try {
           const r = await this.processTab(info.tabIndex, info.windowIndex, key);
@@ -244,9 +278,35 @@ class InjectorCoordinator {
     }
   }
 
+  /**
+   * 这个标签是不是**第一次**被处理？第一次的话要喊一声"重报"。
+   *
+   * 守卫"App 已经送达到就不上报"这条规则是按**页面里的账本**算的，
+   * 而 App 是另一个进程：App 重启后自己手里是空的，
+   * 页面却还留着上一任 App 下发的映射 → 守卫以为"不用报" →
+   * App 永远学不到这个作用域 → 也就不会登记这个标签 →
+   * **快通道根本不盯它** → 换题后只能等主通道那一圈（~1.2 秒）→
+   * 用户"换题立刻复制"就复制出密文（2026-10-23 真机故障：第 1 次成功、第 2 次失败）。
+   *
+   * 每个标签只喊一次：喊完之后页面会把作用域重新报上来，
+   * App 学到之后照常下发映射，之后就是正常节奏。
+   *
+   * 喊的动作是**零额外成本**的：它搭在 pollState 那次 Apple Event 里，
+   * 不另外发一条。
+   */
+  claimResync(tabIndex, windowIndex = null) {
+    const key = tabKey(tabIndex, windowIndex);
+    if (this.resyncedTabs.has(key)) return false;
+    this.resyncedTabs.add(key);
+    return true;
+  }
+
   /** 处理一个标签：轮询状态 → 必要时注入 → 消费待处理队列并下发映射 */
   async processTab(tabIndex, windowIndex = null, jobKey = null) {
-    const state = await this.bridge.pollState({ tabIndex, windowIndex });
+    // **第一次**处理这个标签时喊一声"重报"（见 claimResync 的说明）：
+    // 让页面把已知作用域重新报一遍，App 才学得到 → 才会登记成快轮询标签。
+    const resync = this.claimResync(tabIndex, windowIndex);
+    const state = await this.bridge.pollState({ tabIndex, windowIndex, resync });
     if (process.env.CR_DEBUG) {
       this.log('pollState => ' + JSON.stringify(state).slice(0, 260));
     }
@@ -257,8 +317,12 @@ class InjectorCoordinator {
       return { action: 'evaluate-failed' };
     }
 
+
     // 标签可能被关掉/换位 → 用 URL 校验
-    const watchKey = tabIndex === null || tabIndex === undefined ? 'front' : tabIndex;
+    // **键必须和 watchTab 存进去时完全一致**（见 tabKey 的说明）：
+    // 之前这里用的是裸数字 tabIndex，而存进去的是 `w{w}t{t}` / String(index)
+    // → 永远取不到 → 计数永远不累加 → 强制重注入从不发生。
+    const watchKey = tabKey(tabIndex, windowIndex);
     const watchInfo = this.watched.get(watchKey);
     if (watchInfo && state.url && watchInfo.url && state.url !== watchInfo.url) {
       this.watched.delete(watchKey);
@@ -266,10 +330,14 @@ class InjectorCoordinator {
     }
 
     // 守卫不在 → 注入（顶层 + 递归所有同源 frame）
+    // **版本对不上也算"不在"**：页面里留着旧版守卫时，它不会自己升级
+    // （守卫能就地升级，但得有人重新注入它）。
+    const guardStale =
+      !!state.guard && this.guardVersion !== null && state.guardVersion !== this.guardVersion;
     const tabState = watchInfo || { ticksSinceInject: 0 };
     tabState.ticksSinceInject = (tabState.ticksSinceInject || 0) + 1;
     const forceInject = tabState.ticksSinceInject >= FORCE_INJECT_EVERY;
-    if (!state.guard || forceInject) {
+    if (!state.guard || guardStale || forceInject) {
       tabState.ticksSinceInject = 0;
       try {
         await this.bridge.injectGuard(this.guardSource, {
@@ -279,6 +347,11 @@ class InjectorCoordinator {
         });
         this.state.injections += 1;
         this.state.injected = true;
+        if (guardStale) {
+          this.log(
+            `页面里的守卫是第 ${state.guardVersion} 版，重新注入第 ${this.guardVersion} 版`,
+          );
+        }
         if (tabIndex === this.targetTabIndex) {
           this.log('已向当前标签页注入页面守卫（含所有同源 frame）');
         }
@@ -329,19 +402,38 @@ class InjectorCoordinator {
             reasonText,
         );
         // 出现自定义字体 → 这个标签值得持续看住
-        if (group.font) {
+        //
+        // **只有真建出映射的才登记进快通道**：图标字体(icomoon 之类)建不出映射，
+        // 它们不会换题，不需要快反应 —— 让它们进来只是白花 Apple Event。
+        // (Tauri 侧同口径。)
+        if (group.font && Object.keys(result.mapping).length > 0) {
           this.watchTab(tabIndex, state.url, windowIndex);
           // 而且要**快轮询**：换题后新字体的映射必须尽快就绪，
           // 否则用户"切完题立刻复制"拿到的是原始密文。
           const ckey = jobKey || (tabIndex === null || tabIndex === undefined ? 'front' : `w${windowIndex || 1}t${tabIndex}`);
           this.cipherTabs.set(ckey, { tabIndex, windowIndex, url: state.url });
         }
-        const setResult = await this.bridge.setMapping(group.scopeKey, result.mapping, { tabIndex, windowIndex });
-        if (process.env.CR_DEBUG) this.log('setMapping => ' + JSON.stringify(setResult));
-        if (!setResult || setResult === 'FAILED' || String(setResult).indexOf('NO-') === 0) {
-          this.state.lastError = '映射下发失败: ' + setResult;
+        // **只有真建出映射才 ack**（ack = "App 已经处理过这个作用域"，
+        // 页面收到 ack 就不再上报这个作用域）。
+        //
+        // 建不出映射时（字体取不到 / 分析失败 / 这个作用域本来就是普通字体）
+        // **不下发、也不 ack**：页面会继续上报 → 字体恢复后能自动补上。
+        // 取字体的失败有负缓存（冷却期内不重复请求），所以重试并不贵。
+        //
+        // Tauri 侧同口径（那边也是 mapping 为空就不下发）——
+        // 两边的页面协议必须一致，否则同一份页面在两个 App 上表现不同。
+        if (Object.keys(result.mapping).length === 0) {
+          if (process.env.CR_DEBUG) {
+            this.log('setMapping 跳过（没建出映射）: ' + group.scopeKey.slice(0, 60));
+          }
+        } else {
+          const setResult = await this.bridge.setMapping(group.scopeKey, result.mapping, { tabIndex, windowIndex });
+          if (process.env.CR_DEBUG) this.log('setMapping => ' + JSON.stringify(setResult));
+          if (!setResult || setResult === 'FAILED' || String(setResult).indexOf('NO-') === 0) {
+            this.state.lastError = '映射下发失败: ' + setResult;
+          }
+          mapped += 1;
         }
-        mapped += 1;
       }
     }
     return { action: mapped === 0 ? 'idle' : 'mapped', count: mapped };
@@ -354,6 +446,17 @@ class InjectorCoordinator {
     if (!this.enabled) return { action: 'disabled' };
     if (this.running) return { action: 'busy' };
     if (Date.now() < this.backoffUntil) return { action: 'backoff' };
+
+    // Safari 在不在?不在就**安静跳过这一轮** ——
+    // 任何对 Safari 的 Apple Event 都会把它启动起来,而我们要的是
+    // "浏览器开着就生效",不是"帮用户把浏览器拉起来"。
+    const safariRunning = await this.bridge.isRunning();
+    this.state.safariRunning = safariRunning;
+    if (!safariRunning) {
+      this.state.injected = false;
+      this.state.lastError = '';
+      return { action: 'safari-not-running' };
+    }
 
     this.running = true;
     this.state.running = true;
