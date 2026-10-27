@@ -77,7 +77,22 @@ export default function Stepper({
         {corner ? (
           <div className="app-nodrag absolute top-3 right-3 z-20">{corner}</div>
         ) : null}
-        <div className={`${stepContainerClassName} app-drag flex w-full items-center p-8`}>
+        {/* ⚠️ **这里不能是拖拽区**（2026-10-27 真机踩过）。
+
+            这一行是「步骤圈 + 进度线」，它的**矩形横跨整张卡片**，
+            右上角正好压在**窗口按钮**（最小化 / 叉叉）上面。
+
+            Chromium 的拖拽区是**按矩形**算的：`no-drag` 只有在**这个元素是
+            拖拽元素的子孙**时才会把那块地方「挖空」。而窗口按钮那个容器
+            （`corner`，`absolute top-3 right-3`）是这一行的**兄弟**，不是子孙
+            ⇒ 挖不空 ⇒ **浏览器进程把真实鼠标按下当成了「拖窗口」**，
+            点击根本进不到渲染器 ⇒ 右上角两个按钮点不动。
+
+            （CDP 伪造的点击能过 ⇒ 源码看着没问题；只有真鼠标点击才会暴露。）
+
+            这一行**不需要**自己再声明拖拽：根容器 `app-drag` 的矩形覆盖整个
+            窗口，而这一行是根容器的子孙 ⇒ 照样能拖窗口。 */}
+        <div className={`${stepContainerClassName} flex w-full items-center p-8`}>
           {stepsArray.map((_, index) => {
             const stepNumber = index + 1;
             const isNotLastStep = index < totalSteps - 1;

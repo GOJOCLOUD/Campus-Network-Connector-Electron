@@ -156,17 +156,25 @@ class ManagedBrowser {
   }
 
   /**
-   * 扫进程列表，找「正在用我们这个 profile」的浏览器，取它的调试端口。
+   * 扫进程列表，找「正在用我们这个 profile」的浏览器。
    *
    * 这是最后一道兜底:前两种办法都拿不到时,至少别再去起一个「转发启动」的。
    * profile 路径经**环境变量**传进去(命令行里有中文/空格时引号不可靠)。
+   *
+   * 返回 `{ ports, withoutPort }`：
+   * - `ports`：带 `--remote-debugging-port=` 的那些（能连的候选）
+   * - `withoutPort`：用了我们这个 profile、但**没带调试端口**的浏览器进程数
+   *   （它的存在意味着「再起一个只会是转发启动 ⇒ 只会多开一个标签页」）
    */
   findRunningPorts() {
     const script = [
       "$p = $env:CR_PROFILE",
       "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" |",
       "  Where-Object { $_.CommandLine -and $_.CommandLine.Contains($p) -and $_.CommandLine -notmatch '--type=' } |",
-      "  ForEach-Object { if ($_.CommandLine -match '--remote-debugging-port=(\\d+)') { $Matches[1] } }",
+      "  ForEach-Object {",
+      "    if ($_.CommandLine -match '--remote-debugging-port=(\\d+)') { 'PORT:' + $Matches[1] }",
+      "    else { 'NOPORT' }",
+      "  }",
     ].join('\n');
     // ⚠️ **必须异步**：早先用 execFileSync 同步扫，**把 Electron 主线程卡住最多 15 秒**。
     // 主线程一卡，界面不刷新、CDP 事件不处理、⌃D 的低级键盘钩子也拿不到回调
@@ -174,10 +182,10 @@ class ManagedBrowser {
     // (2026-10-27 真机踩过。)
     return new Promise((resolve) => {
       let settled = false;
-      const done = (ports) => {
+      const done = (result) => {
         if (settled) return;
         settled = true;
-        resolve(ports);
+        resolve(result);
       };
       let child;
       try {
@@ -188,19 +196,23 @@ class ManagedBrowser {
           env: Object.assign({}, process.env, { CR_PROFILE: this.profileDir }),
         });
       } catch (_) {
-        done([]);
+        done({ ports: [], withoutPort: 0 });
         return;
       }
       let out = '';
       if (child.stdout) child.stdout.on('data', (c) => { out += c; });
-      child.on('error', () => done([]));
+      child.on('error', () => done({ ports: [], withoutPort: 0 }));
       child.on('close', () => {
         const ports = [];
+        let withoutPort = 0;
         for (const line of String(out).split(/\r?\n/)) {
-          const port = Number(String(line).trim());
+          const text = String(line).trim();
+          if (text === 'NOPORT') { withoutPort += 1; continue; }
+          if (!text.startsWith('PORT:')) continue;
+          const port = Number(text.slice(5));
           if (Number.isInteger(port) && port > 0 && !ports.includes(port)) ports.push(port);
         }
-        done(ports);
+        done({ ports, withoutPort });
       });
     });
   }
@@ -357,7 +369,8 @@ class ManagedBrowser {
       }
     }
     // 扫进程命令行：可能扫出多个（其中一个是刚转发出去的、端口没真开）⇒ 逐个试
-    for (const port of await this.findRunningPorts()) {
+    const running = await this.findRunningPorts();
+    for (const port of running.ports) {
       const attached = await this.tryAttach(port, { timeoutMs: 1500 });
       if (attached) {
         this.rememberPort(port);
@@ -371,9 +384,28 @@ class ManagedBrowser {
     //
     //    而且这里**不是只看标志**，而是**把退出码等出来**再看
     //    （'exit' 事件是异步派发的，可能比这里晚到 2 秒 —— CI 实测过）。
+    //
+    //    ⚠️ 放在「浏览器已经在跑」**之前**：「用户自己关的」是更具体、更可操作的状态
+    //    （界面会给出「重新打开浏览器」按钮）⇒ 它该优先。
     if (!this.autoReopen && await this.refreshExitState({ waitMs: 3000 })) {
       const error = new Error('浏览器被用户关掉了（不自动重开）');
       error.code = 'BROWSER_CLOSED_BY_USER';
+      throw error;
+    }
+    // ⚠️ **已经有浏览器在跑、只是暂时连不上 ⇒ 绝不能再起一个**（2026-10-27 真机踩过）。
+    //
+    // 同 profile 再起一个 = Chromium 的「转发启动」：新进程不开自己的调试端口，
+    // 只是给**已经在跑**的那个**再开一个标签页**，然后自己退出
+    // ⇒ 页面越积越多，而且新标签页上**没有守卫**（复制出来还是密文）。
+    //
+    // 所以这里如实报错、让下一轮重试连接，**不新起浏览器**。
+    if (running.ports.length > 0 || running.withoutPort > 0) {
+      const error = new Error(
+        running.ports.length > 0
+          ? `浏览器已经在跑（端口 ${running.ports.join('、')}），但暂时连不上；请稍候重试`
+          : '浏览器已经在跑，但连不上；请关掉它再点「重新打开浏览器」',
+      );
+      error.code = 'BROWSER_BUSY';
       throw error;
     }
 
@@ -424,7 +456,18 @@ class ManagedBrowser {
       '--no-first-run',
       '--no-default-browser-check',
       '--no-default-apps',
-      '--restore-last-session',
+      // ⚠️ **不要 `--restore-last-session`**（2026-10-27 真机踩过）。
+      //
+      // 加上它之后，每次启动都会把**上一次会话**的标签页全恢复出来，
+      // 而上一次会话里又包含着上次恢复出来的那些标签页
+      // ⇒ 标签页**越滚越多**（实测：一次启动就恢复出 21 个 `about:blank`）。
+      // 标签页一多，浏览器启动就慢，调试端口迟迟不开 ⇒ 判定成「起不来」
+      // ⇒ 下一轮又拉起一个 ⇒ 又恢复一遍 ⇒ **标签页越来越多、浏览器根本没法用**
+      // （用户原话：「不断的拉起浏览器，浏览器里面的页面超级多，
+      //   而且这个浏览器根本就是无法使用的状态」）。
+      //
+      // 不恢复会话**不影响登录**：cookie / 密码都存在 profile 里，
+      // 照样有效。要恢复的只是「标签页」，而它本来就是噪声。
       'about:blank',
     ];
     this.log(`启动 ${found.label}：${found.executable}（端口 ${port}）`);
@@ -466,20 +509,37 @@ class ManagedBrowser {
       this.lastLaunchError = String((error && error.message) || error);
       // 我们起的这个进程可能只是「转发」给了一个**已经在跑**的浏览器
       // （同 profile 的单例行为）⇒ 真正在服务的那个才是我们要连的。
-      for (const running of await this.findRunningPorts()) {
-        if (running === port) continue;
-        const attached = await this.tryAttach(running, { timeoutMs: 2000 });
+      const running = await this.findRunningPorts();
+      for (const runningPort of running.ports) {
+        if (runningPort === port) continue;
+        const attached = await this.tryAttach(runningPort, { timeoutMs: 2000 });
         if (attached) {
-          this.log(`新起的浏览器没开自己的调试端口（端口 ${port}），改连已经在跑的那个（端口 ${running}）`);
+          this.log(`新起的浏览器没开自己的调试端口（端口 ${port}），改连已经在跑的那个（端口 ${runningPort}）`);
           this.startedByUs = false;
-          this.rememberPort(running);
+          this.rememberPort(runningPort);
           return attached;
         }
       }
       this.log(`浏览器起不来（连续第 ${this.launchFailures} 次）：${this.lastLaunchError}`);
       throw error;
     }
-    this.client = await CdpClient.connect(version.webSocketDebuggerUrl, { log: this.log });
+    try {
+      this.client = await CdpClient.connect(version.webSocketDebuggerUrl, { log: this.log });
+    } catch (error) {
+      // ⚠️ **连不上也要算一次失败**（2026-10-27 真机踩过）。
+      //
+      // 调试端口开了 ≠ 连得上：标签页一多，浏览器忙，WebSocket 握手就可能超时。
+      // 早先这里直接往上抛，而 `launchFailures` 刚在上面被清成 0
+      // ⇒ **失败次数永远不涨** ⇒ 「起不来上限」形同虚设
+      // ⇒ 每 4 秒重试一次，每次都再拉起一个浏览器
+      // ⇒ 用户看到的就是「反反复复拉起浏览器，页面越积越多」。
+      this.launchFailures += 1;
+      this.lastLaunchError = String((error && error.message) || error);
+      this.log(`浏览器连不上（连续第 ${this.launchFailures} 次）：${this.lastLaunchError}`);
+      // 半拉起来的那个别留着：它自己会变成一个「用户看不见的多余浏览器」。
+      try { child.kill(); } catch (_) { /* ignore */ }
+      throw error;
+    }
     this.browser = version;
     this.rememberPort(port);
     return this.client;

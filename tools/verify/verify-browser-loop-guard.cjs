@@ -108,6 +108,37 @@ test('源码层：不能有「反反复复拉起」的那几个坑', () => {
     'ensureOnce() 里没有用 refreshExitState() ⇒ 起浏览器之前没等退出码');
   assert.ok(ensureOnce.indexOf('refreshExitState') < ensureOnce.indexOf('await this.launch('),
     'refreshExitState() 必须排在 launch() **之前**（先问清楚，再决定要不要弹）');
+
+  // ⑧ **不许恢复上一次会话**（2026-10-27 真机踩过）
+  //    `--restore-last-session` ⇒ 每次启动都把上次那堆标签页恢复出来，
+  //    而上次那堆里又包含着上上次恢复出来的 ⇒ 标签页越滚越多（实测 21 个
+  //    `about:blank`）⇒ 浏览器越起越慢 ⇒ 判定成「起不来」⇒ 又拉起一个
+  //    ⇒ 用户原话：「不断的拉起浏览器，浏览器里面的页面超级多，
+  //    而且这个浏览器根本就是无法使用的状态」。
+  //    ⚠️ 只看**启动参数数组**那一段（注释里提到这个标志是解释，不算）。
+  const argsBlock = /const args\s*=\s*\[([\s\S]*?)\];/.exec(src);
+  assert.ok(argsBlock, 'browser.js 里找不到启动参数数组');
+  // 把行注释去掉再查（参数数组里也写了长注释，解释「为什么不能加这个标志」）
+  const argsOnly = argsBlock[1].replace(/\/\/[^\n]*/g, '');
+  assert.ok(!/--restore-last-session/.test(argsOnly),
+    '启动参数里还有 --restore-last-session ⇒ 标签页会越滚越多，浏览器最后没法用');
+
+  // ⑨ **连不上也要算一次失败**
+  //    调试端口开了 ≠ WebSocket 连得上（标签页一多，浏览器忙，握手会超时）。
+  //    早先这里直接抛，而 launchFailures 刚被清成 0 ⇒ 失败次数永远不涨
+  //    ⇒ 「起不来上限」形同虚设 ⇒ 每 4 秒重试一次，每次都再拉起一个浏览器。
+  const launchBody = src.slice(src.indexOf('async launch('));
+  const connectIdx = launchBody.indexOf('CdpClient.connect(');
+  assert.ok(connectIdx > 0, 'launch() 里没有连 CDP（连不上 ⇒ 页面上的守卫挂不上）');
+  const afterConnect = launchBody.slice(connectIdx, connectIdx + 900);
+  assert.ok(/launchFailures\s*\+=\s*1/.test(afterConnect),
+    'CdpClient.connect 失败没有计入 launchFailures ⇒ 「起不来上限」不生效 ⇒ 会无限拉起浏览器');
+
+  // ⑩ **已经有浏览器在跑 ⇒ 绝不能再起一个**
+  //     同 profile 再起一个 = Chromium 的「转发启动」：新进程不开自己的调试端口，
+  //     只是给已经在跑的那个**再开一个标签页** ⇒ 页面越积越多。
+  assert.ok(/BROWSER_BUSY/.test(src),
+    'browser.js 没有「浏览器已经在跑就不许再起」的判定 ⇒ 会不停开新标签页');
 });
 
 test('真跑：用户关掉浏览器 ⇒ 认得出是「用户关的」，而且不自动再拉一个', async (t) => {

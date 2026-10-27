@@ -98,6 +98,19 @@ jobs:
       - name: browser loop guard
         run: node --test tools/verify/verify-browser-loop-guard.cjs
 
+      # 右上角「最小化 / 叉叉」两个按钮**点得动** + 那一栏说明**足够短**的门禁。
+      #
+      # 2026-10-27 用户原话:「右上角的缩小,最小化按钮,以及关闭按钮,
+      # 完全就无法生效,然后打开浏览器这一栏界面说明太详细了,
+      # 看起来乱七八糟的,不够简短」。
+      #
+      # 按钮点不动的根因:`Stepper` 里「步骤圈 + 进度线」那一行带 `app-drag`,
+      # 它的矩形横跨整张卡片、右上角正好压在窗口按钮上
+      # ⇒ Chromium 把真实鼠标按下当成了「拖窗口」⇒ 点击进不到渲染器。
+      # (CDP 伪造的点击能过 ⇒ 只有真鼠标点击才会暴露。)
+      - name: window buttons and copy gate
+        run: node --test tools/verify/verify-window-buttons.cjs
+
       # 「两个 Windows 正式版本要能一眼分清」的门禁。
       #
       # 2026-10-27 用户口径:「Electron版本和那个版本,你根本就没有区分,让我测试」。
