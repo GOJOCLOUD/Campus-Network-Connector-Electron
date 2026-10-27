@@ -667,9 +667,9 @@ function App() {
           (Windows 上没有原生标题栏)⇒ 光看窗口分不出来
           ⇒ 顶部常驻一个小标签,用户一眼知道自己在测哪一个。
           (2026-10-27 用户口径:「你根本就没有区分,让我测试」。)
-          只在 Windows 上显示(mac 的窗口有原生标题栏,本来��分得清)。 */}
+          只在 Windows 上显示(mac 的窗口有原生标题栏,本来就分得清)。 */}
       {!isMac && (
-        <div className="absolute left-3 top-2 text-[11px] leading-none text-gray-400 select-none pointer-events-none">
+        <div className="absolute left-3 top-2 z-10 rounded-md bg-white/90 px-1.5 py-0.5 text-[11px] leading-none text-gray-600 ring-1 ring-gray-200 shadow-sm select-none pointer-events-none">
           {BUILD_FLAVOR}
         </div>
       )}
