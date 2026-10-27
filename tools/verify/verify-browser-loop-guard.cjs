@@ -96,6 +96,18 @@ test('源码层：不能有「反反复复拉起」的那几个坑', () => {
   // ⑥ 记住浏览器进程怎么退的（退出码 0 = 用户自己关了窗口）
   assert.ok(/child\.on\('exit'/.test(src), 'browser.js 没有监听浏览器进程的 exit（分不清「用户关的」和「崩的」）');
   assert.ok(/closedByUser\(\)/.test(src), 'browser.js 缺少 closedByUser()');
+
+  // ⑦ 起浏览器之前，必须**把退出码等出来**再判断
+  //    （'exit' 事件是 Node 事件循环**异步**派发的，可能比判断晚 2 秒
+  //      —— 2026-10-27 CI 实测：`Browser.close` 之后 2 秒退出事件才到
+  //        ⇒ 那时标志还是 false ⇒ 「用户关的」又被弹了一个。）
+  assert.ok(/refreshExitState/.test(src),
+    'browser.js 缺少 refreshExitState（退出码还没等出来就判断 ⇒ 又会弹一个）');
+  const ensureOnce = src.slice(src.indexOf('async ensureOnce('), src.indexOf('async launch('));
+  assert.ok(/refreshExitState/.test(ensureOnce),
+    'ensureOnce() 里没有用 refreshExitState() ⇒ 起浏览器之前没等退出码');
+  assert.ok(ensureOnce.indexOf('refreshExitState') < ensureOnce.indexOf('await this.launch('),
+    'refreshExitState() 必须排在 launch() **之前**（先问清楚，再决定要不要弹）');
 });
 
 test('真跑：用户关掉浏览器 ⇒ 认得出是「用户关的」，而且不自动再拉一个', async (t) => {
@@ -220,6 +232,10 @@ test('真跑：用户关掉浏览器 ⇒ 不该再弹一个（2026-10-27 真机�
       /* ignore */
     }
     await new Promise((r) => setTimeout(r, 1500));
+    // ⚠️ 退出事件是**异步**派发的：CI 实测 `Browser.close` 之后 **2 秒**才到
+    //   ⇒ 不能 sleep 一下就断言（那样门禁自己会假红），
+    //   要用产品代码**同一个**手段把退出码等出来。
+    await browser.refreshExitState({ waitMs: 5000 });
     assert.strictEqual(browser.closedByUser(), true, '没认出是「用户关掉了窗口」');
 
     // 再跑几轮 ⇒ **不许**再起一个

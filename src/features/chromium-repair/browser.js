@@ -108,6 +108,13 @@ class ManagedBrowser {
     /** 上一次是我们起的那个浏览器**被用户关掉了窗口**（退出码 0）吗？ */
     this.userClosed = false;
     /**
+     * 「上一个进程的退出结果」**不再参考**（用户点了「重新打开浏览器」）。
+     *
+     * 为什么需要它：`refreshExitState()` 会从**上一个**进程（退出码 0）
+     * 再推一次「用户关的」⇒ 刚点完「重新打开」就又不弹了。
+     */
+    this.exitStateIgnored = false;
+    /**
      * 用户自己关掉的窗口，要不要**自动**再弹一个？
      *
      * 由协调器按产品口径下发（默认 false = 不自动弹）。
@@ -264,6 +271,65 @@ class ManagedBrowser {
   /** 用户点了「重新打开浏览器」⇒ 把「用户关的」这个状态清掉 */
   clearClosedByUser() {
     this.userClosed = false;
+    // ⚠️ 连「上一个进程的退出结果」一起作废：
+    //   refreshExitState() 是从**那个**进程推出来的 ⇒ 不作废的话，
+    //   刚点完「重新打开浏览器」，下一轮又被推回「用户关的」⇒ 又不弹了。
+    this.exitStateIgnored = true;
+  }
+
+  /**
+   * 把「我们起的那个浏览器进程怎么退的」问清楚。
+   *
+   * ⚠️ **为什么不能只看 `userClosed` 标志**：
+   *   那个标志是在 `child.on('exit')` 里设的，而 'exit' 事件是 Node 的事件循环
+   *   **异步**派发的 ⇒ 进程已经死了、事件还没送到时，标志还是 false
+   *   ⇒ 就会「明明是用户关掉了窗口，却又弹了一个」。
+   *   （2026-10-27 CI 实测：`Browser.close` 之后 **2 秒**退出事件才到，
+   *     而判断发生在这之前 ⇒ 门禁红、用户那边就是「又弹了一个」。）
+   *
+   * 所以这里**把退出码等出来**再决定。
+   *
+   * @param {{waitMs?:number}} [opts] 最多等多久（毫秒）
+   * @returns {Promise<boolean>} true = 用户关掉了窗口（退出码 0）
+   */
+  async refreshExitState({ waitMs = 3000 } = {}) {
+    if (this.exitStateIgnored) return false;
+    const child = this.process;
+    if (!child) return false;
+    if (child.exitCode === null && child.signalCode === null) {
+      // 退出码还没到 ⇒ 进程可能刚死、事件还没派发 ⇒ 等它（最多 waitMs）。
+      await this.waitChildExit(child, waitMs);
+    }
+    if (child.exitCode === null && child.signalCode === null) return false;
+    // 只认「当前这个进程」的退出（换了浏览器之后老进程的 exit 事件还会晚到一步）
+    if (this.process === child) {
+      this.userClosed = child.exitCode === 0;
+    }
+    return this.userClosed;
+  }
+
+  /**
+   * 等 child 的退出结果（最多 waitMs 毫秒）。
+   * @param {import('node:child_process').ChildProcess} child
+   * @param {number} waitMs
+   */
+  waitChildExit(child, waitMs) {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    if (!waitMs) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, waitMs);
+      if (typeof timer.unref === 'function') timer.unref();
+      child.once('exit', finish);
+      child.once('close', finish);
+      child.once('error', finish);
+    });
   }
 
   /**
@@ -303,8 +369,9 @@ class ManagedBrowser {
     //    ⇒ 只在 tick 开头判会漏掉「刚好在那一轮之前关掉」的情况
     //    ⇒ 2026-10-27 真机复验就是这样又弹了一个（明明已经认出是「用户关的」）。
     //
-    //    走到这里时，tryAttach + 扫进程已经花掉约 2 秒 ⇒ 退出事件**一定**已经被处理了。
-    if (!this.autoReopen && this.closedByUser()) {
+    //    而且这里**不是只看标志**，而是**把退出码等出来**再看
+    //    （'exit' 事件是异步派发的，可能比这里晚到 2 秒 —— CI 实测过）。
+    if (!this.autoReopen && await this.refreshExitState({ waitMs: 3000 })) {
       const error = new Error('浏览器被用户关掉了（不自动重开）');
       error.code = 'BROWSER_CLOSED_BY_USER';
       throw error;
@@ -367,6 +434,10 @@ class ManagedBrowser {
     this.startedByUs = true;
     this.port = port;
     this.childExit = null;
+    // 新起了一个浏览器 ⇒ 之前那个的退出结果**不再作数**，
+    // 「用户关的」这个状态也要清掉（不然新浏览器一起来就显示「浏览器已关闭」）。
+    this.userClosed = false;
+    this.exitStateIgnored = false;
     // 记下它**怎么退的**：退出码 0 = 用户自己关了窗口；非 0 = 崩了/被杀了。
     // 区分得出来，才能「用户关的不再弹给他看，崩了的才自动恢复」。
     child.on('exit', (code, signal) => {
