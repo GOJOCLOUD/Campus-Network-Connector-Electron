@@ -401,16 +401,18 @@ async function probe(page) {
       const mainJs = fs.readFileSync(path.join(__dirname, '..', '..', 'main.js'), 'utf8');
       // 查的是**开关常量**:注册那条路一直在,开关决定它跑不跑。
       const switchOn = /const GLOBAL_SHORTCUTS_ENABLED\s*=\s*true/.test(mainJs);
-      check('Electron 的全局快捷键开关是**开**的(⌃⇧D 要抢)',
+      check('Electron 的全局快捷键开关是**开**的(⌃D 要抢)',
         switchOn,
         switchOn ? 'GLOBAL_SHORTCUTS_ENABLED = true' : '没找到 GLOBAL_SHORTCUTS_ENABLED = true');
-      // 注册的**键**必须只有 ⌃⇧D。
-      const regD = /globalShortcut\.register\(\s*'Ctrl\+Shift\+D'/.test(mainJs);
-      check('Electron 注册了 ⌃⇧D(要抢的就是它)', regD, regD ? '' : "没找到 register('Ctrl+Shift+D')");
-      // **不能**还留着 ⌃D:用户明确要求换键(而且 ⌃D 在别的软件里是「退出」那一族)。
-      const regPlainD = /globalShortcut\.register\(\s*'Ctrl\+D'/.test(mainJs);
-      check('Electron **没有**再注册 ⌃D(用户口径:改用 ⌃⇧D)', !regPlainD,
-        regPlainD ? "居然还注册着 'Ctrl+D'" : '');
+      // 注册的**键**必须有 ⌃D(主键)—— 用户 2026-10-27 口径:
+      // 「把快捷键都搞成 Ctrl+D」。
+      const regD = /globalShortcut\.register\(\s*'Ctrl\+D'/.test(mainJs);
+      check('Electron 注册了 ⌃D(主键:用户 2026-10-27 口径)', regD, regD ? '' : "没找到 register('Ctrl+D')");
+      // **容错别名** ⌃⇧D 也要在:系统全局热键是**精确匹配**,手上多带一个
+      // Shift 时 ⌃D 不触发 ⇒ 那个 D 会漏进前台应用(10-23 抱怨过的「多打出一个 D」)。
+      const regDAlt = /globalShortcut\.register\(\s*'Ctrl\+Shift\+D'/.test(mainJs);
+      check('Electron 也注册了 ⌃⇧D(容错别名:手上多带一个 Shift 时也触发)', regDAlt,
+        regDAlt ? '' : "没找到 register('Ctrl+Shift+D')");
       const regS = /globalShortcut\.register\(\s*'Ctrl\+S'/.test(mainJs);
       check('Electron **没有**注册 ⌃S(默认执行:Windows 那屏已撤,且 Ctrl+S 是「保存」)',
         !regS, regS ? '居然注册了 Ctrl+S' : '');

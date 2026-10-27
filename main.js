@@ -787,22 +787,23 @@ ipcMain.handle('native:getStatus', async () => ({
   platform: process.platform,
   // 快捷键与 latch 的诊断字段(与 mac 分支的 `[shortcut]` 日志同口径)。
   //
-  // Windows 线**抢 ⌃⇧D**(读剪贴板并键入),**不抢 ⌃S** —— 理由见
+  // Windows 线**抢 ⌃D**(主键)+ **⌃⇧D**(容错别名),**不抢 ⌃S** —— 理由见
   // `GLOBAL_SHORTCUTS_ENABLED` 的注释。
-  // ⇒ `shortcutCtrlShiftD` = ⌃⇧D 注册成功没有;`globalShortcutsEnabled` = 全局键这条路
+  // ⇒ `shortcutCtrlD` = ⌃D 注册成功没有;`globalShortcutsEnabled` = 全局键这条路
   // 是**开着**的;`shortcutPasteRegistered` = **抢到了没有**(界面靠它显示提示)。
   shortcutCtrlS: shortcutStatus.ctrlS,
+  shortcutCtrlD: shortcutStatus.ctrlD,
   shortcutCtrlShiftD: shortcutStatus.ctrlShiftD,
   latchAvailable: shortcutStatus.latchAvailable,
   latchArmed: shortcutStatus.latchArmed,
   controlWatcherRunning: shortcutStatus.controlWatcherRunning,
   globalShortcutsEnabled: GLOBAL_SHORTCUTS_ENABLED,
-  // ⌃⇧D **抢到了没有** —— 界面要用它显示提示。
+  // ⌃D **抢到了没有** —— 界面要用它显示提示。
   //
   // 抢不到 = 别的软件先注册了同一个组合键 ⇒
-  // 我们的 ⌃⇧D **不会触发**,而目标软件自己的 Ctrl+Shift+D 也**照常生效**
-  // (所以那个软件还是会被它的「退出」关掉)⇒ 必须让用户知道。
-  shortcutPasteRegistered: shortcutStatus.ctrlShiftD === true,
+  // 我们的 ⌃D **不会触发**,而目标软件自己的 Ctrl+D 也**照常生效**
+  // (所以那个软件还是会被它的「收藏夹 / 退出」之类动作干掉)⇒ 必须让用户知道。
+  shortcutPasteRegistered: shortcutStatus.ctrlD === true,
 }));
 
 ipcMain.handle('native:mouseClick', async (_e, x, y) => {
@@ -1086,20 +1087,29 @@ function createWindow() {
 
 // Windows 线**要不要注册全局快捷键**。
 //
-// ## 开着,而且**只抢 ⌃⇧D**(2026-10-25 换键后的口径)
+// ## 开着,抢 **⌃D**(主键)+ **⌃⇧D**(容错别名)(2026-10-27 改口径)
 //
 // 用户原话(2026-10-24):「干脆直接把系统的抢了,我的软件优先级最高,这是最简单的办法,
 // 因为 Ctrl 加 D 我发现在普通桌面它是退出软件的功能,那在使用这个的时候
 // 没必要退出吧,所以说我就给他压制住」。
 //
-// 用户原话(2026-10-25):「你不要用 ctrl+D 了,**直接 ctrl+shift+D 吧**」。
+// 用户原话(2026-10-25):「你不要用 ctrl+D 了,**直接 ctrl+shift+D 吧」。
 //
-// - **抢 ⌃⇧D(读剪贴板并键入)**:自己注册成全局热键,别的软件就**收不到**它
-//   ⇒ 模拟输入时按到它,那个软件**不会被自己的「退出」关掉**。
+// 用户原话(2026-10-27):「**把快捷键都搞成 Ctrl+D**」⇒ 换回 ⌃D 当主键。
 //
-//   换成 ⌃⇧D 的理由:**⌃D 冲突太重** —— 在普通 Windows 软件里,Ctrl+D 常常是
-//   「**退出软件**」那一族动作(菜单加速键),抢它容易和别人打架;
-//   而 **⌃⇧D 几乎没人用** ⇒ 抢到的概率高得多。
+// - **抢 ⌃D(读剪贴板并键入)**:自己注册成全局热键,别的软件就**收不到**它
+//   ⇒ 模拟输入时按到它,那个软件**不会被自己的「退出 / 收藏夹」关掉**。
+//
+//   ⚠️ **代价必须说清楚**:⌃D 在 Edge/Chrome 是「收藏夹」、在 VS Code 是
+//   「选中下一处」、在 Excel 是「向下填充」⇒ **本软件开着的时候,
+//   别的软件里按 Ctrl+D 它们收不到**。界面与文档里都要写明这件事。
+//
+// - **⌃⇧D 是容错别名**:系统全局热键是**精确匹配**,手上多带一个 Shift
+//   就对不上 ⇒ 按键不被吃掉 ⇒ 那个 D 漏进前台应用(10-23 用户抱怨过的
+//   「多打出一个 D」),同时动作也不执行(看起来像失灵)。
+//   mac 线是自己监听按键、只看「有没有 Control」⇒ 多带修饰键照样触发。
+//   ⇒ Windows 侧把 ⌃⇧D 也注册上(它本来就是 10-25 之后的主键,
+//   **不新增占用**),把「多带一个 Shift」这件事兜住。
 //
 //   能不能真抢到,取决于**谁先注册**:
 //   - 对方是**菜单加速键**(绝大多数软件的「退出」都是)⇒ 我们的
@@ -1124,7 +1134,9 @@ const GLOBAL_SHORTCUTS_ENABLED = true;
 const shortcutStatus = {
   /** ⌃S(默认执行 = 回放)注册成功没有 */
   ctrlS: false,
-  /** ⌃⇧D(剪贴板直输)注册成功没有 */
+  /** ⌃D(剪贴板直输)**主键**注册成功没有 */
+  ctrlD: false,
+  /** ⌃⇧D(剪贴板直输)**容错别名**注册成功没有 */
   ctrlShiftD: false,
   /** latch 可用吗(= Control 只读观察器起来了没有) */
   latchAvailable: false,
@@ -1179,7 +1191,7 @@ async function triggerPinyinFromClipboard() {
   // 其余流程(读剪贴板 / textbox 来源 / 空文本处理)与 mac 侧**同构**。
   const autoSwitch = process.platform === 'darwin' ? !!autoSwitchImeSetting : false;
 
-  console.log(`[shortcut] ⌃⇧D 直输:来源=${source} 长度=${t.length} 切输入源=${autoSwitch}`);
+  console.log(`[shortcut] ⌃D 直输:来源=${source} 长度=${t.length} 切输入源=${autoSwitch}`);
   await pinyinType(t, 0, autoSwitch);
 }
 
@@ -1190,6 +1202,7 @@ function registerShortcuts() {
     // 它们现在是"恒为 false / 不适用",配合 `native:getStatus` 里的
     // `globalShortcutsEnabled` 能一眼看出是**按政策不注册**。
     shortcutStatus.ctrlS = false;
+    shortcutStatus.ctrlD = false;
     shortcutStatus.ctrlShiftD = false;
     shortcutStatus.latchAvailable = false;
     shortcutStatus.latchArmed = false;
@@ -1200,15 +1213,15 @@ function registerShortcuts() {
 
   // ── 下面这条是「真的注册全局键」的路 ──
   //
-  // 快捷键:**⌃⇧D** = 读剪贴板并键入(我们抢的就是它,理由见
-  // `GLOBAL_SHORTCUTS_ENABLED` 的注释)。
+  // 快捷键:**⌃D** = 读剪贴板并键入(主键);**⌃⇧D** 是容错别名
+  // (理由见 `GLOBAL_SHORTCUTS_ENABLED` 的注释)。
   //
   // ⌃S(默认执行)**不注册**:Windows 上那一屏已经没有界面了,
   // 而 Ctrl+S 在别的软件里是「保存」,抢过来会把人家的保存弄坏。
   //
   // ## latch(2026-10-23 用户要求)
   //
-  // > 「触发之后 Ctrl+Shift+D 整个按键就不再会继续影响它了,
+  // > 「触发之后 Ctrl+D 整个按键就不再会继续影响它了,
   // > 除非下一次重新按住 Ctrl,再点击相应的字母」
   //
   // `globalShortcut` **只在按下时回调**,不告诉你 Control 什么时候松开 ⇒
@@ -1258,21 +1271,29 @@ function registerShortcuts() {
     fn().catch(e => console.error(`[shortcut] ${name} failed`, e));
   };
 
-  // **只注册 ⌃⇧D**。抢没抢到看返回值:抢不到 ⇒ 别的软件先注册了同一个组合键
-  // ⇒ 界面要把这件事显示出来(见 `native:getStatus` 的 `shortcutPasteRegistered`)。
-  const okD = globalShortcut.register('Ctrl+Shift+D', fire(triggerPinyinFromClipboard, 'pinyin'));
+  // **注册 ⌃D(主键)+ ⌃⇧D(容错别名)**。抢没抢到看返回值:抢不到 ⇒
+  // 别的软件先注册了同一个组合键 ⇒ 界面要把这件事显示出来
+  // (见 `native:getStatus` 的 `shortcutPasteRegistered`)。
+  const okD = globalShortcut.register('Ctrl+D', fire(triggerPinyinFromClipboard, 'pinyin'));
   if (okD !== true) {
-    console.warn('[shortcut] ⌃⇧D 没抢到(这个组合键被别的软件先注册了):'
-      + '按它不会触发我们,目标软件自己的 Ctrl+Shift+D 也会照常生效。');
+    console.warn('[shortcut] ⌃D 没抢到(这个组合键被别的软件先注册了):'
+      + '按它不会触发我们,目标软件自己的 Ctrl+D 也会照常生效。');
+  }
+  // 容错别名:手上多带一个 Shift 时,⌃D 因为**精确匹配**不会触发 ⇒
+  // 这个别名把那条路兜住(它本来就是 10-25 之后的主键 ⇒ 不新增占用)。
+  const okDAlt = globalShortcut.register('Ctrl+Shift+D', fire(triggerPinyinFromClipboard, 'pinyin'));
+  if (okDAlt !== true) {
+    console.warn('[shortcut] ⌃⇧D(容错别名)没抢到:手上多带一个 Shift 时可能触发不了。');
   }
 
   shortcutStatus.ctrlS = false;
-  shortcutStatus.ctrlShiftD = okD === true;
+  shortcutStatus.ctrlD = okD === true;
+  shortcutStatus.ctrlShiftD = okDAlt === true;
   shortcutStatus.latchAvailable = canLatch;
   shortcutStatus.latchArmed = latch.isArmed();
   shortcutStatus.controlWatcherRunning = canLatch;
 
-  console.log(`[shortcut] Ctrl+Shift+D=${okD} latch=${canLatch}`);
+  console.log(`[shortcut] Ctrl+D=${okD} Ctrl+Shift+D(别名)=${okDAlt} latch=${canLatch}`);
 }
 
 // ── App Lifecycle ──
