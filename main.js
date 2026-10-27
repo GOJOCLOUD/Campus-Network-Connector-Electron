@@ -1051,6 +1051,20 @@ function createWindow() {
 
   mainWindow.setAlwaysOnTop(true, 'screen-saver');
 
+  // 页面 <title> 不许顶掉我们设的窗口标题。
+  //
+  // Electron 默认行为:页面标题一变,窗口标题就跟着变
+  // (`page-title-updated` 默认会改标题)。前端 `index.html` 里写的是
+  // `<title>模拟输入</title>` ⇒ 窗口标题最后变成「模拟输入」,
+  // 跟 Tauri 版**一模一样** ⇒ 任务栏悬停/Alt+Tab 里分不出在测哪一个。
+  // (2026-10-27 真机实测抓到:明明 main.js 里写了
+  //  `title: '模拟输入（Electron 版）'`,窗口标题却是「模拟输入」。)
+  //
+  // 这里直接 preventDefault ⇒ 窗口标题永远是上面设的那个。
+  mainWindow.on('page-title-updated', (event) => {
+    event.preventDefault();
+  });
+
   // 录制用的「排除矩形」必须**跟着窗口走**。
   //
   // 「点自己界面上的按钮不算一次点击」靠它实现:落在自己窗口范围内的点击不记。
