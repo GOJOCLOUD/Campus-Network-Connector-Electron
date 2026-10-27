@@ -98,6 +98,97 @@ test('源码层：不能有「反反复复拉起」的那几个坑', () => {
   assert.ok(/closedByUser\(\)/.test(src), 'browser.js 缺少 closedByUser()');
 });
 
+test('真跑：用户关掉浏览器 ⇒ 认得出是「用户关的」，而且不自动再拉一个', async (t) => {
+  if (!isWindows) {
+    t.skip('只有 Windows 上有意义');
+    return;
+  }
+  const { ManagedBrowser } = require(path.join(ROOT, 'src', 'features', 'chromium-repair', 'browser.js'));
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cnc-exitcode-'));
+  const browser = new ManagedBrowser({ profileDir, log: (m) => console.log('    [browser]', m) });
+
+  /** 等浏览器进程退出（最多 20 秒） */
+  const waitExit = (b) =>
+    new Promise((resolve) => {
+      const started = Date.now();
+      const timer = setInterval(() => {
+        if (b.childExit) {
+          clearInterval(timer);
+          resolve(b.childExit);
+        } else if (Date.now() - started > 20000) {
+          clearInterval(timer);
+          resolve(null);
+        }
+      }, 100);
+    });
+
+  try {
+    const { client } = await browser.ensure();
+    const exited = waitExit(browser);
+    // `Browser.close` = 用户点叉关掉窗口（干净退出 ⇒ 退出码 0）
+    try {
+      await client.send('Browser.close');
+    } catch (_) {
+      /* 关连接后会断，忽略 */
+    }
+    const exit = await exited;
+    assert.ok(exit, '等不到浏览器进程退出');
+    assert.strictEqual(exit.code, 0,
+      `正常关掉浏览器时退出码应该是 0，实际是 ${exit.code}（非 0 ⇒ 分不清「用户关的」和「崩的」）`);
+    assert.strictEqual(browser.closedByUser(), true,
+      '正常关掉浏览器后，closedByUser() 应该是 true');
+
+    // 崩溃那一条：强杀 ⇒ 退出码非 0 ⇒ **不**算「用户关的」
+    const profileDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'cnc-kill-'));
+    const browser2 = new ManagedBrowser({ profileDir2, log: (m) => console.log('    [browser2]', m) });
+    await browser2.ensure();
+    const exited2 = waitExit(browser2);
+    const pid = browser2.process.pid;
+    execFileSync('powershell.exe', ['-NoProfile', '-Command', `Stop-Process -Id ${pid} -Force`], {
+      timeout: 15000,
+      windowsHide: true,
+    });
+    const exit2 = await exited2;
+    assert.ok(exit2, '等不到被强杀的浏览器进程退出');
+    assert.notStrictEqual(exit2.code, 0,
+      '被强杀的浏览器退出码不该是 0（否则「崩了」也会被当成「用户关的」）');
+    assert.strictEqual(browser2.closedByUser(), false,
+      '浏览器被强杀（崩了）时，closedByUser() 应该是 false ⇒ 仍然自动恢复');
+
+    for (const pid2 of browsersForProfile(profileDir2)) {
+      try {
+        execFileSync('powershell.exe', ['-NoProfile', '-Command', `Stop-Process -Id ${pid2} -Force`], {
+          timeout: 10000,
+          windowsHide: true,
+        });
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    try {
+      fs.rmSync(profileDir2, { recursive: true, force: true });
+    } catch (_) {
+      /* ignore */
+    }
+  } finally {
+    for (const pid of browsersForProfile(profileDir)) {
+      try {
+        execFileSync('powershell.exe', ['-NoProfile', '-Command', `Stop-Process -Id ${pid} -Force`], {
+          timeout: 10000,
+          windowsHide: true,
+        });
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    try {
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    } catch (_) {
+      /* ignore */
+    }
+  }
+});
+
 test('真跑：并发调三次 ensure() 只该起一个浏览器', async (t) => {
   if (!isWindows) {
     t.skip('只有 Windows 上有意义');
