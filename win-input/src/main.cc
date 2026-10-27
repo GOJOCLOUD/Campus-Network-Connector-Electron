@@ -166,6 +166,8 @@ static std::atomic<bool> g_kbDDown{false};
 static std::atomic<bool> g_kbSwallowKeyUp{false};
 static std::atomic<DWORD> g_kbHookThreadId{0};
 static HHOOK g_kbHook = nullptr;
+/// 钩子装不上时的错误码(在**钩子线程**上取的 —— 别的线程取到的不是同一个值)。
+static DWORD g_kbHookError = 0;
 static std::mutex g_kbTsfnMutex;
 static Napi::ThreadSafeFunction g_kbTsfn;
 static std::mutex g_kbThreadMutex;
@@ -223,6 +225,7 @@ static void kbHookThreadFunc() {
     HMODULE hMod = GetModuleHandleW(nullptr);
     HHOOK h = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hMod, 0);
     if (!h) {
+        g_kbHookError = GetLastError();
         g_kbHookReady.store(false);
         g_kbHookRunning.store(false);
         g_kbHookThreadId.store(0);
@@ -278,9 +281,11 @@ Napi::Value StartCtrlDHook(const Napi::CallbackInfo& info) {
     Napi::Object out = Napi::Object::New(env);
     const bool ok = g_kbHookReady.load();
     out.Set("ok", Napi::Boolean::New(env, ok));
-    out.Set("error", Napi::String::New(
-        env, ok ? "" : "SetWindowsHookExW(WH_KEYBOARD_LL) 失败(错误码 " +
-                        std::to_string(GetLastError()) + ")"));
+    const std::string error = ok
+        ? std::string()
+        : std::string("SetWindowsHookExW(WH_KEYBOARD_LL) 失败(错误码 ")
+              + std::to_string(g_kbHookError) + ")";
+    out.Set("error", Napi::String::New(env, error.c_str()));
     return out;
 }
 
