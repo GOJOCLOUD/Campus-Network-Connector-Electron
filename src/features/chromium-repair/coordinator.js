@@ -74,6 +74,8 @@ class CdpCoordinator {
      * （那不是「用户关的」，退出码非 0）。
      */
     this.autoReopen = false;
+    // 把口径告诉浏览器那边：**判定必须发生在真正起浏览器之前**（见 browser.js 的注释）。
+    if (this.browser) this.browser.autoReopen = false;
     /** ordinal -> { url, ticksSinceInject, resynced } */
     this.watched = new Map();
     /** ordinal -> { url }：带混淆字体的标签，走快轮询 */
@@ -108,6 +110,7 @@ class CdpCoordinator {
    */
   setAutoReopen(autoReopen) {
     this.autoReopen = autoReopen !== false;
+    if (this.browser) this.browser.autoReopen = this.autoReopen;
     if (this.autoReopen) {
       // 改成自动重开 ⇒ 立刻把「用户关的」这个状态清掉，下一轮就能重开。
       this.browser.clearClosedByUser();
@@ -387,7 +390,20 @@ class CdpCoordinator {
         this.state.injected = false;
         return { action: 'browser-closed-by-user' };
       }
-      const bridge = await this.ensureBridge();
+      let bridge;
+      try {
+        bridge = await this.ensureBridge();
+      } catch (error) {
+        // 「用户自己关掉了那个浏览器窗口」**不是故障** ⇒ 不打错误日志，
+        // 如实把状态报给界面（界面显示「重新打开浏览器」按钮）。
+        if (error && error.code === 'BROWSER_CLOSED_BY_USER') {
+          this.state.browserClosedByUser = true;
+          this.state.browserRunning = false;
+          this.state.injected = false;
+          return { action: 'browser-closed-by-user' };
+        }
+        throw error;
+      }
       this.state.browserRunning = this.browser.isRunning();
       let mapped = 0;
       let action = 'idle';

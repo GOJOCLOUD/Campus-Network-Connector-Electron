@@ -189,6 +189,69 @@ test('真跑：用户关掉浏览器 ⇒ 认得出是「用户关的」，而且
   }
 });
 
+test('真跑：用户关掉浏览器 ⇒ 不该再弹一个（2026-10-27 真机复验抓出来的 race）', async (t) => {
+  if (!isWindows) {
+    t.skip('只有 Windows 上有意义');
+    return;
+  }
+  const { ManagedBrowser } = require(path.join(ROOT, 'src', 'features', 'chromium-repair', 'browser.js'));
+  const { CdpCoordinator } = require(path.join(ROOT, 'src', 'features', 'chromium-repair', 'coordinator.js'));
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cnc-norelaunch-'));
+  const browser = new ManagedBrowser({ profileDir, log: (m) => console.log('    [browser]', m) });
+  const coordinator = new CdpCoordinator({
+    log: (m) => console.log('    [coord]', m),
+    browser,
+    guardPath: path.join(ROOT, 'vendor', 'page-guard.js'),
+    frameBridgePath: path.join(ROOT, 'vendor', 'frame-bridge.js'),
+  });
+  // 口径：**用户自己关掉的窗口不再自动弹一个**（2026-10-27 用户拍板的方向）。
+  coordinator.setAutoReopen(false);
+  coordinator.setEnabled(true);
+
+  try {
+    await coordinator.tick();
+    const portBefore = browser.port;
+    assert.ok(portBefore > 0, '浏览器没起来');
+
+    // 用户点叉（= 干净退出，退出码 0）
+    try {
+      await browser.client.send('Browser.close');
+    } catch (_) {
+      /* ignore */
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.strictEqual(browser.closedByUser(), true, '没认出是「用户关掉了窗口」');
+
+    // 再跑几轮 ⇒ **不许**再起一个
+    for (let i = 0; i < 5; i++) {
+      await coordinator.tick();
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    assert.strictEqual(browser.port, portBefore,
+      `端口变了（${portBefore} → ${browser.port}）⇒ 又起了一个浏览器（用户关的不该自动弹）`);
+    const st = coordinator.getStatus();
+    assert.strictEqual(st.browserClosedByUser, true,
+      '状态没有如实上报「浏览器被用户关掉了」（界面就看不到「重新打开浏览器」按钮）');
+  } finally {
+    coordinator.stop();
+    for (const pid of browsersForProfile(profileDir)) {
+      try {
+        execFileSync('powershell.exe', ['-NoProfile', '-Command', `Stop-Process -Id ${pid} -Force`], {
+          timeout: 10000,
+          windowsHide: true,
+        });
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    try {
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    } catch (_) {
+      /* ignore */
+    }
+  }
+});
+
 test('真跑：并发调三次 ensure() 只该起一个浏览器', async (t) => {
   if (!isWindows) {
     t.skip('只有 Windows 上有意义');

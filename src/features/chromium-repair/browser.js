@@ -107,6 +107,13 @@ class ManagedBrowser {
     this.lastLaunchError = '';
     /** 上一次是我们起的那个浏览器**被用户关掉了窗口**（退出码 0）吗？ */
     this.userClosed = false;
+    /**
+     * 用户自己关掉的窗口，要不要**自动**再弹一个？
+     *
+     * 由协调器按产品口径下发（默认 false = 不自动弹）。
+     * ⚠️ 判定放在**真正起浏览器之前**才有效（见 ensureOnce 里的注释）。
+     */
+    this.autoReopen = false;
   }
 
   /**
@@ -291,6 +298,18 @@ class ManagedBrowser {
         return { client: attached, started: false, browser: this.browserLabel() };
       }
     }
+    // ⚠️ **这个判定必须放在起浏览器之前**（而不是只在 tick 开头看一次）：
+    //    tick 每 300ms 一轮，而浏览器的「进程退出事件」与 tick 之间有时间差
+    //    ⇒ 只在 tick 开头判会漏掉「刚好在那一轮之前关掉」的情况
+    //    ⇒ 2026-10-27 真机复验就是这样又弹了一个（明明已经认出是「用户关的」）。
+    //
+    //    走到这里时，tryAttach + 扫进程已经花掉约 2 秒 ⇒ 退出事件**一定**已经被处理了。
+    if (!this.autoReopen && this.closedByUser()) {
+      const error = new Error('浏览器被用户关掉了（不自动重开）');
+      error.code = 'BROWSER_CLOSED_BY_USER';
+      throw error;
+    }
+
     // 真的没有 ⇒ 这才自己起一个
     if (this.launchFailures >= this.maxLaunchFailures) {
       throw new Error(
