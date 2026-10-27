@@ -358,6 +358,9 @@ class CdpCoordinator {
     } catch (error) {
       const message = String((error && error.message) || error);
       this.state.lastError = message;
+      // ⚠️ **要打日志**：只写 lastError 的话，界面上一闪而过、日志里什么都没有
+      // ⇒ 2026-10-27 真机「每 29 秒重开一个 Edge」就是这么查了半天。
+      this.log('浏览器修复失败:' + message);
       this.backoffUntil = Date.now() + 4000;
       return { action: 'error', error: message };
     } finally {
