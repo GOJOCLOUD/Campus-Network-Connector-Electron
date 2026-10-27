@@ -149,6 +149,16 @@ jobs:
       - name: shortcut latch regression test
         run: node --test tools/verify/verify-shortcut-latch.cjs
 
+      # 硬门禁:⌃D 的**优先级**必须由**低级键盘钩子**来扛(跑不过就不发包)。
+      #
+      # 2026-10-27 真人反馈:在**微信**里按 ⌃D 是微信自己的动作,我们的功能不触发。
+      # 当场查过:微信用的是**低级键盘钩子**(`WH_KEYBOARD_LL`),而 Windows 的输入顺序是
+      # 「低级钩子 → 系统热键 → 目标窗口」⇒ 它在系统热键**之前**就把键处理掉了
+      # ⇒ 我们的 `WM_HOTKEY` 根本没来过。
+      # ⇒ 只能**自己也装一个**低级钩子,把 ⌃D 吞掉(后安装的钩子先被调用)。
+      - name: hotkey priority gate
+        run: node --test tools/verify/verify-hotkey-priority.cjs
+
       - name: Build native addon + renderer + NSIS installer
         run: npm run dist:win
 

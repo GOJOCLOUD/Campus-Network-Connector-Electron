@@ -794,6 +794,8 @@ ipcMain.handle('native:getStatus', async () => ({
   shortcutCtrlS: shortcutStatus.ctrlS,
   shortcutCtrlD: shortcutStatus.ctrlD,
   shortcutCtrlShiftD: shortcutStatus.ctrlShiftD,
+  // Windows 专用:低级键盘钩子装上了没有(⌃D 的优先级靠它,见 ADR-0023)。
+  shortcutHookCtrlD: shortcutStatus.hookCtrlD,
   latchAvailable: shortcutStatus.latchAvailable,
   latchArmed: shortcutStatus.latchArmed,
   controlWatcherRunning: shortcutStatus.controlWatcherRunning,
@@ -803,7 +805,9 @@ ipcMain.handle('native:getStatus', async () => ({
   // 抢不到 = 别的软件先注册了同一个组合键 ⇒
   // 我们的 ⌃D **不会触发**,而目标软件自己的 Ctrl+D 也**照常生效**
   // (所以那个软件还是会被它的「收藏夹 / 退出」之类动作干掉)⇒ 必须让用户知道。
-  shortcutPasteRegistered: shortcutStatus.ctrlD === true,
+  // 钩子装上了 ⇒ ⌃D 也算**抢到了**(哪怕系统热键没抢到)⇒
+  // 界面那条「没抢到」的提示就**不该**出现。
+  shortcutPasteRegistered: shortcutStatus.ctrlD === true || shortcutStatus.hookCtrlD === true,
 }));
 
 ipcMain.handle('native:mouseClick', async (_e, x, y) => {
@@ -1136,8 +1140,15 @@ const shortcutStatus = {
   ctrlS: false,
   /** ⌃D(剪贴板直输)**主键**注册成功没有 */
   ctrlD: false,
-  /** ⌃⇧D(剪贴板直输)**容错别名**注册成功没有 */
+  /** ⌃⇧D(剪贴板直入)**容错别名**注册成功没有 */
   ctrlShiftD: false,
+  /**
+   * **低级键盘钩子**装上了没有(Windows 专用)。
+   *
+   * 装上了 ⇒ ⌃D 由我们的钩子收,微信那类**用钩子抢键**的软件压不过我们;
+   * 没装上 ⇒ ⌃D 只剩「系统热键」那一级 ⇒ 微信仍然会抢走它。
+   */
+  hookCtrlD: false,
   /** latch 可用吗(= Control 只读观察器起来了没有) */
   latchAvailable: false,
   /** 当前是不是武装的(诊断用) */
@@ -1286,14 +1297,42 @@ function registerShortcuts() {
     console.warn('[shortcut] ⌃⇧D(容错别名)没抢到:手上多带一个 Shift 时可能触发不了。');
   }
 
+  // Windows:⌃D 的**优先级**靠**低级键盘钩子**(见 ADR-0023)。
+  //
+  // 2026-10-27 真人反馈:在**微信**里按 ⌃D 是微信自己的动作,我们的功能不触发;
+  // 别的软件里一切正常 ⇒ 微信用的是 `WH_KEYBOARD_LL`(低级键盘钩子),
+  // 而 Windows 的输入顺序是「低级钩子 → 系统热键 → 目标窗口」
+  // ⇒ 微信在系统热键**之前**就把键处理掉了 ⇒ 我们的 `WM_HOTKEY` 根本没来过。
+  //
+  // 办法:我们自己装一个低级键盘钩子,看到 ⌃D 就**吞掉它**
+  // ⇒ 微信收不到、系统热键也收不到 ⇒ 只有我们响应(也不会重复触发)。
+  //
+  // ⚠️ Windows 的规则是「**后安装的钩子先被调用**」⇒ 本软件后启动就赢;
+  //    对方后启动就对方赢。这是机制问题,用户这边绕不过去。
+  //
+  // 钩子装不上时**如实降级**:还有 `globalShortcut` 那条路(系统热键),
+  // 但那种情况下压不过用钩子的软件 —— 界面会照实说。
+  const firePaste = fire(triggerPinyinFromClipboard, 'pinyin');
+  let hookCtrlD = false;
+  if (process.platform === 'win32' && native && typeof native.startCtrlDHook === 'function') {
+    const r = native.startCtrlDHook(firePaste);
+    hookCtrlD = !!(r && r.ok);
+    if (!hookCtrlD) {
+      console.warn('[shortcut] 低级键盘钩子没装上 ⇒ ⌃D 只剩「系统热键」那一级'
+        + '(微信那类用钩子的软件仍然会抢走它):'
+        + (r && r.error ? r.error : '未知原因'));
+    }
+  }
+
   shortcutStatus.ctrlS = false;
   shortcutStatus.ctrlD = okD === true;
   shortcutStatus.ctrlShiftD = okDAlt === true;
+  shortcutStatus.hookCtrlD = hookCtrlD;
   shortcutStatus.latchAvailable = canLatch;
   shortcutStatus.latchArmed = latch.isArmed();
   shortcutStatus.controlWatcherRunning = canLatch;
 
-  console.log(`[shortcut] Ctrl+D=${okD} Ctrl+Shift+D(别名)=${okDAlt} latch=${canLatch}`);
+  console.log(`[shortcut] Ctrl+D=${okD} Ctrl+Shift+D(别名)=${okDAlt} latch=${canLatch} hook=${hookCtrlD}`);
 }
 
 // ── App Lifecycle ──

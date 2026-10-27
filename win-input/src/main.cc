@@ -119,6 +119,193 @@ static void hookThreadFunc() {
     g_hookThreadId = 0;
 }
 
+// ── Low-Level Keyboard Hook(⌃D 的「优先级」)───────────────────────────────
+//
+// ## 为什么需要它
+//
+// 2026-10-27 真人反馈:**在微信里**按 ⌃D 是微信自己的动作,我们的「读剪贴板并键入」
+// 不触发;别的软件里一切正常。
+//
+// 当场查过(不是猜):微信**没有**用系统热键 —— 我们自己的 `RegisterHotKey(Ctrl+D)`
+// 是**注册成功**的 ⇒ 微信用的是**低级键盘钩子**(`WH_KEYBOARD_LL`)。
+// Windows 的输入顺序是
+//
+//     **低级钩子 → 系统热键 → 目标窗口**
+//
+// ⇒ 微信在**系统热键之前**就把 Ctrl+D 处理掉了 ⇒ 我们的 `WM_HOTKEY` 根本没来过。
+//
+// ## 怎么赢
+//
+// Windows 的规则:**后安装的钩子先被调用** ⇒ 我们自己装一个 `WH_KEYBOARD_LL`,
+// 看到 Ctrl+D 就**吞掉它**(返回 1)⇒ 微信收不到、系统热键也收不到 ⇒ 只有我们响应。
+//
+// ⚠️ 诚实说明:这**不是**绝对保证 —— 对方**后启动**的话,它的钩子会先被调用,
+// 我们就收不到。这是 Windows 的机制,用户这边绕不过去(见 ADR-0023)。
+//
+// ## 为什么「吞掉」不新增代价
+//
+// 我们本来就用 `globalShortcut.register('Ctrl+D')` 把这个键**系统级占住**了
+// ⇒ 按下去本来就不会送到前台软件(Edge 的收藏夹之类的一直就不生效)。
+// 吞掉只是把「谁来处理」从系统热键换成我们的钩子。
+//
+// ## 与 latch 的关系
+//
+// latch(触发一次必须松开 Control 才重新武装)仍然由**只读的** Control 观察器
+// (`watchControlKey`,`GetAsyncKeyState` 轮询)负责 —— 本钩子只负责「认键」。
+// JS 那边走的是**同一个** `fire()` 包装,latch 规则一字不改。
+//
+// ## 修饰键状态:自己跟,不用 GetAsyncKeyState
+//
+// 钩子能看到**所有**按键的按下/松开 ⇒ 自己的 Ctrl 状态最可靠
+// (`GetAsyncKeyState` 在钩子回调里的更新时机是「异步」的,偶尔会差一拍)。
+static std::atomic<bool> g_kbHookRunning{false};
+static std::atomic<bool> g_kbHookReady{false};
+static std::atomic<bool> g_kbHookStop{false};
+static std::atomic<bool> g_kbCtrlDown{false};
+static std::atomic<bool> g_kbDDown{false};
+static std::atomic<bool> g_kbSwallowKeyUp{false};
+static std::atomic<DWORD> g_kbHookThreadId{0};
+static HHOOK g_kbHook = nullptr;
+static std::mutex g_kbTsfnMutex;
+static Napi::ThreadSafeFunction g_kbTsfn;
+static std::mutex g_kbThreadMutex;
+static std::thread g_kbThread;
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode != HC_ACTION) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    auto* info = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+    if (!info) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+    const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+    const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+    // Control 的按下/松开:自己跟,给「是不是 ⌃D」用。
+    if (info->vkCode == VK_CONTROL) g_kbCtrlDown.store(down);
+
+    // 'D' = 0x44。⌃⇧D 也算 —— 它是容错别名,同一个动作。
+    if (info->vkCode == 0x44) {
+        if (down) {
+            if (g_kbCtrlDown.load()) {
+                g_kbSwallowKeyUp.store(true);
+                // 自动重复(按住不放)⇒ 只触发第一次。
+                if (!g_kbDDown.exchange(true)) {
+                    Napi::ThreadSafeFunction tsfn = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(g_kbTsfnMutex);
+                        tsfn = g_kbTsfn;
+                    }
+                    if (tsfn) {
+                        // NonBlocking:钩子回调必须尽快返回(LowLevelHooksTimeout)。
+                        tsfn.NonBlockingCall([](Napi::Env env, Napi::Function cb) {
+                            cb.Call({Napi::Undefined::New(env)});
+                        });
+                    }
+                }
+                // 吞掉:微信收不到、系统热键也收不到 ⇒ 只有我们响应,不会重复触发。
+                return 1;
+            }
+            g_kbDDown.store(false);
+        } else if (up) {
+            g_kbDDown.store(false);
+            // 按下被吞了 ⇒ 松开也要吞(否则前台软件会看到一个「凭空出现的松开」)。
+            if (g_kbSwallowKeyUp.exchange(false)) return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+// 钩子线程:装钩子 + 消息循环(低级钩子**必须**有消息循环才会被调用)。
+static void kbHookThreadFunc() {
+    g_kbHookThreadId.store(GetCurrentThreadId());
+    // 起始状态取当前物理状态,别凭空造一个边沿。
+    g_kbCtrlDown.store((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
+
+    HMODULE hMod = GetModuleHandleW(nullptr);
+    HHOOK h = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hMod, 0);
+    if (!h) {
+        g_kbHookReady.store(false);
+        g_kbHookRunning.store(false);
+        g_kbHookThreadId.store(0);
+        return;
+    }
+    g_kbHook = h;
+    g_kbHookReady.store(true);
+
+    MSG msg;
+    while (!g_kbHookStop.load()) {
+        const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+        if (r == 0 || r == -1) break;   // WM_QUIT / 出错
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_kbHook) {
+        UnhookWindowsHookEx(g_kbHook);
+        g_kbHook = nullptr;
+    }
+    g_kbHookReady.store(false);
+    g_kbHookRunning.store(false);
+    g_kbHookThreadId.store(0);
+}
+
+// 装上钩子;回调在 JS 线程上被调用(收到 ⌃D 时)。
+//
+// 返回 `{ ok: bool, error: string }` —— 装不上要**如实**说,别假装生效。
+Napi::Value StartCtrlDHook(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "startCtrlDHook 需要一个回调函数")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_kbTsfnMutex);
+        g_kbTsfn = Napi::ThreadSafeFunction::New(
+            env, info[0].As<Napi::Function>(), "ctrl-d-hook", 0, 1);
+        // Unref:别让它挡住 Electron 事件循环退出
+        g_kbTsfn.Unref(env);
+    }
+    if (!g_kbHookRunning.load()) {
+        g_kbHookStop.store(false);
+        g_kbHookRunning.store(true);
+        std::lock_guard<std::mutex> lock(g_kbThreadMutex);
+        g_kbThread = std::thread(kbHookThreadFunc);
+    }
+    // 等钩子线程起来(最多 500ms)—— 起不来就**如实**告诉调用方。
+    for (int i = 0; i < 50 && !g_kbHookReady.load(); i++) {
+        Sleep(10);
+    }
+    Napi::Object out = Napi::Object::New(env);
+    const bool ok = g_kbHookReady.load();
+    out.Set("ok", Napi::Boolean::New(env, ok));
+    out.Set("error", Napi::String::New(
+        env, ok ? "" : "SetWindowsHookExW(WH_KEYBOARD_LL) 失败(错误码 " +
+                        std::to_string(GetLastError()) + ")"));
+    return out;
+}
+
+// 停掉钩子(可重复调用)。
+static void stopCtrlDHook() {
+    g_kbHookStop.store(true);
+    const DWORD tid = g_kbHookThreadId.load();
+    if (tid != 0) PostThreadMessageW(tid, WM_QUIT, 0, 0);
+    std::thread t;
+    {
+        std::lock_guard<std::mutex> lock(g_kbThreadMutex);
+        if (g_kbThread.joinable()) t = std::move(g_kbThread);
+    }
+    if (t.joinable()) t.join();
+    g_kbHookRunning.store(false);
+    g_kbHookReady.store(false);
+}
+
+// env 销毁前把钩子线程停掉 —— 否则它会往一个已经销毁的 env 上投递。
+//
+// ⚠️ 钩子签名必须是 **无参**的 `void()`(同 stopControlWatchOnEnvCleanup 的理由)。
+static void stopCtrlDHookOnEnvCleanup() {
+    stopCtrlDHook();
+}
+
 // ── Helper: create error object ──────────────────────────────────────────
 
 static Napi::Value MakeError(Napi::Env env, const char* msg) {
@@ -751,10 +938,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getCurrentInputSource", Napi::Function::New(env, GetCurrentInputSource));
     exports.Set("selectInputSource",   Napi::Function::New(env, SelectInputSource));
     exports.Set("watchControlKey",     Napi::Function::New(env, WatchControlKey));
+    exports.Set("startCtrlDHook",       Napi::Function::New(env, StartCtrlDHook));
 
     // env 销毁前把观察线程停掉 —— 否则它会往一个已经销毁的 env 上投递。
     // (CleanupHook 的析构**不会**注销钩子,所以这里注册了就一直有效。)
     env.AddCleanupHook(&stopControlWatchOnEnvCleanup);
+    env.AddCleanupHook(&stopCtrlDHookOnEnvCleanup);
 
     return exports;
 }
