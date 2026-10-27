@@ -83,21 +83,23 @@ test('源码层：恢复浏览器时必须先找、最后才起', () => {
   // ⚠️ 结束点要用「下一个方法定义」(`\n  browserLabel() {`)——
   //    用 'browserLabel()' 这个词会先命中 ensure() 内部的 `this.browserLabel()`
   //    ⇒ 把 ensure() 截成一小段，断言就全是假的。
-  const ensureStart = src.indexOf('async ensure()');
+  // ⚠️ 定位的是 `ensureOnce()`（真正干活的那个）——
+  //    `ensure()` 现在只是「单飞外壳」（并发调用共享同一次尝试）。
+  const ensureStart = src.indexOf('async ensureOnce()');
   const ensureEnd = src.indexOf('\n  browserLabel() {', ensureStart);
-  assert.ok(ensureStart >= 0, 'browser.js 里找不到 ensure()');
-  assert.ok(ensureEnd > ensureStart, 'browser.js 里找不到 ensure() 的结尾');
+  assert.ok(ensureStart >= 0, 'browser.js 里找不到 ensureOnce()');
+  assert.ok(ensureEnd > ensureStart, 'browser.js 里找不到 ensureOnce() 的结尾');
   const ensure = src.slice(ensureStart, ensureEnd);
   const iRemembered = ensure.indexOf('readRememberedPort()');
   const iDevTools = ensure.indexOf('readPortFromProfile()');
   const iScan = ensure.indexOf('findRunningPorts()');
   const iLaunch = ensure.indexOf('this.launch()');
-  assert.ok(iRemembered >= 0, 'ensure() 里没有试「自己记的端口」');
-  assert.ok(iDevTools >= 0, 'ensure() 里没有试 DevToolsActivePort');
-  assert.ok(iScan >= 0, 'ensure() 里没有扫进程命令行');
-  assert.ok(iLaunch >= 0, 'ensure() 里没有 launch()');
+  assert.ok(iRemembered >= 0, 'ensureOnce() 里没有试「自己记的端口」');
+  assert.ok(iDevTools >= 0, 'ensureOnce() 里没有试 DevToolsActivePort');
+  assert.ok(iScan >= 0, 'ensureOnce() 里没有扫进程命令行');
+  assert.ok(iLaunch >= 0, 'ensureOnce() 里没有 launch()');
   assert.ok(iLaunch > iRemembered && iLaunch > iDevTools && iLaunch > iScan,
-    'ensure() 必须**先找、最后才起**新的浏览器（同 profile 的第二个是「转发启动」，起了等于白起）');
+    'ensureOnce() 必须**先找、最后才起**新的浏览器（同 profile 的第二个是「转发启动」，起了等于白起）');
 
   // launch() 成功之后要记住端口（否则下次连不上就找不回来了）
   const launch = src.slice(src.indexOf('async launch()'));

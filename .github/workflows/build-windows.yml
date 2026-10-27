@@ -80,6 +80,32 @@ jobs:
       - name: browser recovery gate
         run: node --test tools/verify/verify-browser-recovery.cjs
 
+      # 「反反复复拉起浏览器」的门禁(2026-10-27 用户真机反馈带出来的)。
+      #
+      # 用户原话:「只要我打开了,他就反反复复拉起浏览器,而且拉起浏览器一直都是失败,
+      # 根本没有一个窗口,起来的浏览器根本就不能用」。
+      #
+      # 真机取证得到的根因链(每一条都对应下面的一条断言):
+      #   ① 用户关掉 Edge 窗口 ⇒ 软件又偷偷拉起一个新的(带「还原页面」气泡、标签页全丢);
+      #   ② ensure() 没有互斥 ⇒ 并发的三条调用路径各起一个浏览器;
+      #   ③ 扫进程用 execFileSync(同步) ⇒ 把主线程卡住最多 15 秒
+      #      (界面不刷新、CDP 事件不处理、⌃D 的低级键盘钩子拿不到回调);
+      #   ④ 连「已经在跑的浏览器」也要白等 5 秒;
+      #   ⑤ 起不来就无限重试,没有上限;
+      #   ⑥ 浏览器自己的 stdout/stderr 被丢掉了 ⇒ 出事时日志里一个字都没有。
+      #
+      # 这条门禁还会**真跑一遍**:并发调三次 ensure() ⇒ 只该起**一个**浏览器。
+      - name: browser loop guard
+        run: node --test tools/verify/verify-browser-loop-guard.cjs
+
+      # 「两个 Windows 正式版本要能一眼分清」的门禁。
+      #
+      # 2026-10-27 用户口径:「Electron版本和那个版本,你根本就没有区分,让我测试」。
+      # 两个版本界面一模一样,窗口又是自绘的(Windows 上没有原生标题栏)
+      # ⇒ 顶部徽标 / 托盘提示 / 窗口标题 / 安装名四处必须**都**写清楚是哪个版本。
+      - name: build flavor gate
+        run: node --test tools/verify/verify-build-flavor.cjs
+
       # 硬门禁:共享代码的一条不变量(跑不过就不发包)。
       #
       # 字形渲染的**栅格尺寸**必须与参考字形库一致 ——

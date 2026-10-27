@@ -49,7 +49,8 @@ let browser = null;
  */
 const HINT_ON =
   '本软件已打开一个自己的 Edge 窗口 —— 请在这个窗口里上网、答题；' +
-  '关掉它后本软件会重新打开。首次使用需要扫码登录一次。';
+  '关掉它之后本软件**不会**自动再开一个（下面有「重新打开浏览器」按钮）。' +
+  '首次使用需要扫码登录一次。';
 
 function init({ log, settings, app } = {}) {
   if (coordinator) return coordinator;
@@ -90,6 +91,8 @@ function status() {
   return {
     ...state,
     supported: true,
+    browserClosedByUser: state.browserClosedByUser === true,
+    autoReopen: coordinator.autoReopen !== false,
     // 界面把「浏览器没开」当中性状态处理；Windows 线上是**我们自己开的**浏览器，
     // 所以这里不暴露 safariRunning 那个字段（那是 mac 线的口径）。
     hint: state.enabled ? HINT_ON : '',
@@ -112,6 +115,18 @@ function registerIpc(ipcMain, { settings } = {}) {
   ipcMain.handle('chromiumRepair:checkNow', async () => {
     if (!coordinator) return { action: 'not-initialized' };
     return coordinator.tick();
+  });
+
+  // 用户点了「重新打开浏览器」
+  ipcMain.handle('chromiumRepair:reopenBrowser', async () => {
+    if (!coordinator) return { action: 'not-initialized' };
+    return coordinator.reopenBrowser();
+  });
+
+  // 「关掉窗口之后要不要自动重开」
+  ipcMain.handle('chromiumRepair:setAutoReopen', async (enabled) => {
+    if (!coordinator) return { action: 'not-initialized' };
+    return { autoReopen: coordinator.setAutoReopen(enabled) };
   });
 }
 

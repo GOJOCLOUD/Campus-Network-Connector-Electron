@@ -62,7 +62,7 @@
   },
   "build": {
     "appId": "com.gojocloud.campus-network-connector",
-    "productName": "模拟输入",
+    "productName": "模拟输入-Electron",
     "asar": true,
     "directories": {
       "output": "release"
@@ -104,7 +104,7 @@
       "allowToChangeInstallationDirectory": true,
       "unicode": true,
       "installerIcon": "build/win-icon.ico",
-      "shortcutName": "模拟输入"
+      "shortcutName": "模拟输入（Electron 版）"
     },
     "asarUnpack": [
       "win-input/**"

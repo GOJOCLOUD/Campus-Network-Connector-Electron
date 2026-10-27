@@ -89,6 +89,9 @@ contextBridge.exposeInMainWorld('cnc', {
   getFeatureStatus(prefix) { return ipcRenderer.invoke(prefix + ':getStatus'); },
   setFeatureEnabled(prefix, enabled) { ipcRenderer.send(prefix + ':setEnabled', !!enabled); },
   setFeatureEnabledSetting(prefix, enabled) { ipcRenderer.send(prefix + ':setEnabledSetting', !!enabled); },
+  // 「重新打开浏览器」—— Windows 线的「浏览器复制修复」用；
+  // 别的功能没有这个 IPC ⇒ 调用会失败，前端 catch 掉即可。
+  reopenFeatureBrowser(prefix) { return ipcRenderer.invoke(prefix + ':reopenBrowser'); },
 
   // 注意:Safari 复制修复走 Apple Events,只在 macOS 上存在 —— Windows 版
   // 没有这个能力,所以不暴露这组接口(免得调用方拿到一个必然失败的 Promise)。

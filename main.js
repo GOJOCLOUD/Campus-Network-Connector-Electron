@@ -152,7 +152,7 @@ function createTray() {
       return;
     }
     tray = new Tray(iconPath);
-    tray.setToolTip('模拟输入');
+    tray.setToolTip('模拟输入（Electron 版）');
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: '显示窗口', click: () => showMainWindow() },
       { label: '退出程序', click: () => { isQuitting = true; app.quit(); } },
@@ -1020,6 +1020,11 @@ ipcMain.handle('play:pinyinInput', async (_e, text, delaySeconds, autoSwitchIme)
 
 function createWindow() {
   mainWindow = new BrowserWindow({
+    // 窗口标题:Windows 上这个窗口是 `frame:false` 自绘的(没有原生标题栏),
+    // 但**任务栏悬停提示**与 Alt+Tab 列表读的就是它 ⇒
+    // 用它告诉用户「这是 Electron 版」
+    // (两个 Windows 正式版本并存,界面一模一样,2026-10-27 用户要求能分清)。
+    title: '模拟输入（Electron 版）',
     width: 520,
     height: 640,
     // 去掉 macOS 自带的标题栏,但**保留原生红绿灯**,并把它挪到左上角那片透明区:

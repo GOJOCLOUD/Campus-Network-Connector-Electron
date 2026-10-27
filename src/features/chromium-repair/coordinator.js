@@ -63,6 +63,17 @@ class CdpCoordinator {
     this.running = false;
     this.fastRunning = false;
     this.backoffUntil = 0;
+    /**
+     * 用户自己关掉了那个浏览器窗口，要不要**自动**再开一个？
+     *
+     * 机制见 browser.js 的 `closedByUser()`（退出码 0 = 用户关的）。
+     *
+     * 默认 **false**：用户自己关的窗口**不再自动弹一个**给他
+     * （2026-10-27 用户口径：「反反复复拉起浏览器」）⇒ 界面给一个
+     * 「重新打开浏览器」按钮。**崩溃/被强杀仍然自动恢复**
+     * （那不是「用户关的」，退出码非 0）。
+     */
+    this.autoReopen = false;
     /** ordinal -> { url, ticksSinceInject, resynced } */
     this.watched = new Map();
     /** ordinal -> { url }：带混淆字体的标签，走快轮询 */
@@ -79,12 +90,38 @@ class CdpCoordinator {
       unresolved: 0,
       ticks: 0,
       watchedTabs: 0,
+      /** 浏览器**被用户关掉了**（⇒ 界面要说清楚，而不是装作还在跑） */
+      browserClosedByUser: false,
     };
   }
 
   /** 装上字形引擎（两条线共用同一个引擎实现，见 safari-repair/engine.js） */
   setEngine(engine) {
     this.engine = engine;
+  }
+
+  /**
+   * 用户自己关掉了浏览器窗口之后，要不要自动重开。
+   *
+   * @param {boolean} autoReopen true = 自动重开（会退避、失败有上限）；
+   *                          false = 不自动重开，由界面给一个「重新打开」按钮。
+   */
+  setAutoReopen(autoReopen) {
+    this.autoReopen = autoReopen !== false;
+    if (this.autoReopen) {
+      // 改成自动重开 ⇒ 立刻把「用户关的」这个状态清掉，下一轮就能重开。
+      this.browser.clearClosedByUser();
+      this.state.browserClosedByUser = false;
+    }
+    return this.autoReopen;
+  }
+
+  /** 用户点了「重新打开浏览器」⇒ 清掉状态并立刻起一个 */
+  async reopenBrowser() {
+    this.state.browserClosedByUser = false;
+    this.browser.clearClosedByUser();
+    this.backoffUntil = 0;
+    return this.tick();
   }
 
   setEnabled(enabled) {
@@ -341,6 +378,15 @@ class CdpCoordinator {
     this.running = true;
     this.state.running = true;
     try {
+      // 用户自己关掉了那个浏览器窗口 ⇒ **不要**再偷偷弹一个给他
+      // （2026-10-27 用户口径：「反反复复拉起浏览器」）。
+      // 界面会显示「浏览器已关闭」+ 一个「重新打开」按钮。
+      if (!this.autoReopen && this.browser.closedByUser()) {
+        this.state.browserClosedByUser = true;
+        this.state.browserRunning = false;
+        this.state.injected = false;
+        return { action: 'browser-closed-by-user' };
+      }
       const bridge = await this.ensureBridge();
       this.state.browserRunning = this.browser.isRunning();
       let mapped = 0;

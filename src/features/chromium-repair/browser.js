@@ -22,7 +22,7 @@ const fs = require('fs');
 const os = require('os');
 const net = require('net');
 const path = require('path');
-const { spawn, execFileSync } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { CdpClient, waitForEndpoint } = require('./cdp');
 
 /** 浏览器候选：优先 Edge（我们验证过），再退到 Chrome */
@@ -95,6 +95,18 @@ class ManagedBrowser {
     this.browser = null;
     this.port = null;
     this.startedByUs = false;
+    /** 单飞：并发的 ensure() 共享同一次尝试 */
+    this.pendingEnsure = null;
+    /** 我们起的浏览器进程怎么退的：{code, signal, at} */
+    this.childExit = null;
+    /** 连续几次起不来浏览器（到上限就不再重试） */
+    this.launchFailures = 0;
+    /** 连续失败的上限 */
+    this.maxLaunchFailures = 3;
+    /** 上一次起不来的原因（给界面/日志看的原话） */
+    this.lastLaunchError = '';
+    /** 上一次是我们起的那个浏览器**被用户关掉了窗口**（退出码 0）吗？ */
+    this.userClosed = false;
   }
 
   /**
@@ -142,23 +154,41 @@ class ManagedBrowser {
       "  Where-Object { $_.CommandLine -and $_.CommandLine.Contains($p) -and $_.CommandLine -notmatch '--type=' } |",
       "  ForEach-Object { if ($_.CommandLine -match '--remote-debugging-port=(\\d+)') { $Matches[1] } }",
     ].join('\n');
-    try {
-      const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-        encoding: 'utf8',
-        timeout: 15_000,
-        windowsHide: true,
-        env: Object.assign({}, process.env, { CR_PROFILE: this.profileDir }),
-      });
-      const ports = [];
-      for (const line of String(out).split(/\r?\n/)) {
-        const port = Number(String(line).trim());
-        if (Number.isInteger(port) && port > 0 && !ports.includes(port)) ports.push(port);
+    // ⚠️ **必须异步**：早先用 execFileSync 同步扫，**把 Electron 主线程卡住最多 15 秒**。
+    // 主线程一卡，界面不刷新、CDP 事件不处理、⌃D 的低级键盘钩子也拿不到回调
+    // (Windows 会把超时的钩子摘掉) ⇒ 整个软件像死了一样。
+    // (2026-10-27 真机踩过。)
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (ports) => {
+        if (settled) return;
+        settled = true;
+        resolve(ports);
+      };
+      let child;
+      try {
+        child = execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+          encoding: 'utf8',
+          timeout: 15_000,
+          windowsHide: true,
+          env: Object.assign({}, process.env, { CR_PROFILE: this.profileDir }),
+        });
+      } catch (_) {
+        done([]);
+        return;
       }
-      return ports;
-    } catch (_) {
-      /* ignore */
-    }
-    return [];
+      let out = '';
+      if (child.stdout) child.stdout.on('data', (c) => { out += c; });
+      child.on('error', () => done([]));
+      child.on('close', () => {
+        const ports = [];
+        for (const line of String(out).split(/\r?\n/)) {
+          const port = Number(String(line).trim());
+          if (Number.isInteger(port) && port > 0 && !ports.includes(port)) ports.push(port);
+        }
+        done(ports);
+      });
+    });
   }
 
   /** 从 profile 目录里读出上次那个浏览器的调试端口（Chromium 自己写的） */
@@ -173,11 +203,18 @@ class ManagedBrowser {
     }
   }
 
-  /** 试着连上「已经开着的那台」；连不上返回 null */
-  async tryAttach(port) {
+  /**
+   * 试着连上「已经开着的那台」；连不上返回 null。
+   *
+   * @param {number} port
+   * @param {{timeoutMs?:number}} [opts] 等调试端口的时限。
+   *   连「**已经在跑的**浏览器」必须**短**（默认 800ms）：端口没开就是没开，
+   *   早先等 5 秒 ⇒ 每个候选端口白白耗掉 5 秒，用户看到的是「半分钟才动一下」。
+   */
+  async tryAttach(port, { timeoutMs = 800 } = {}) {
     try {
-      const version = await waitForEndpoint(port, 5000);
-      const client = await CdpClient.connect(version.webSocketDebuggerUrl, { log: this.log });
+      const version = await waitForEndpoint(port, timeoutMs);
+      const client = await CdpClient.connect(version.webSocketDebuggerUrl, { log: this.log, timeoutMs: 5000 });
       this.client = client;
       this.port = port;
       this.browser = version;
@@ -197,6 +234,36 @@ class ManagedBrowser {
     if (this.client && !this.client.closed) {
       return { client: this.client, started: this.startedByUs, browser: this.browserLabel() };
     }
+    // ⚠️ **单飞**：主轮询(300ms) / 快轮询 / IPC 手动检查 三条路都会调 ensure()。
+    //   早先没有这把锁 ⇒ 谁先发现「浏览器没了」谁就起一个 Edge ⇒ 起好几个，
+    //   用户看到的就是「反反复复拉起浏览器」。
+    if (this.pendingEnsure) return this.pendingEnsure;
+    this.pendingEnsure = this.ensureOnce().finally(() => {
+      this.pendingEnsure = null;
+    });
+    return this.pendingEnsure;
+  }
+
+  /**
+   * 上一次是我们起的那个浏览器**被用户关掉了窗口**吗？
+   *
+   * 退出码 0 = 用户关的；非 0 = 崩了。区分得出来，
+   * 才能「用户关的不再弹给他看，崩了的才自动恢复」。
+   */
+  closedByUser() {
+    return this.userClosed === true;
+  }
+
+  /** 用户点了「重新打开浏览器」⇒ 把「用户关的」这个状态清掉 */
+  clearClosedByUser() {
+    this.userClosed = false;
+  }
+
+  /**
+   * 真的找不到了 —— 这才自己起一个。
+   * @returns {Promise<{client:import('./cdp').CdpClient, started:boolean, browser:string}>}
+   */
+  async ensureOnce() {
     // 找「已经开着的那台」—— 顺序按可靠程度:
     //   ① 我们自己记的端口（我们起的那个，最可靠）
     //   ② Chromium 写的 DevToolsActivePort（别人起的那个）
@@ -217,14 +284,19 @@ class ManagedBrowser {
       }
     }
     // 扫进程命令行：可能扫出多个（其中一个是刚转发出去的、端口没真开）⇒ 逐个试
-    for (const port of this.findRunningPorts()) {
-      const attached = await this.tryAttach(port);
+    for (const port of await this.findRunningPorts()) {
+      const attached = await this.tryAttach(port, { timeoutMs: 1500 });
       if (attached) {
         this.rememberPort(port);
         return { client: attached, started: false, browser: this.browserLabel() };
       }
     }
     // 真的没有 ⇒ 这才自己起一个
+    if (this.launchFailures >= this.maxLaunchFailures) {
+      throw new Error(
+        `连续 ${this.launchFailures} 次起不来浏览器，已停止重试：${this.lastLaunchError || '原因未知'}`,
+      );
+    }
     await this.launch();
     return { client: this.client, started: this.startedByUs, browser: this.browserLabel() };
   }
@@ -233,6 +305,23 @@ class ManagedBrowser {
     if (!this.browser) return '未知浏览器';
     const name = this.browser['Browser'] || '';
     return name.replace(/^[A-Za-z]+\//, '') || '浏览器';
+  }
+
+  /**
+   * 浏览器进程的 stdout/stderr 落到 profile 目录里。
+   *
+   * 早先 `stdio:'ignore'` 把它们全丢了 ⇒ 浏览器为什么起不来、为什么没窗口，
+   * 日志里一个字都没有 (2026-10-27 真机查了半天就是这个坑)。
+   */
+  browserStdio() {
+    try {
+      fs.mkdirSync(this.profileDir, { recursive: true });
+      const out = fs.openSync(path.join(this.profileDir, 'browser-stdout.log'), 'a');
+      const err = fs.openSync(path.join(this.profileDir, 'browser-stderr.log'), 'a');
+      return ['ignore', out, err];
+    } catch (_) {
+      return 'ignore';
+    }
   }
 
   /** 启动浏览器并连上 */
@@ -253,21 +342,43 @@ class ManagedBrowser {
       'about:blank',
     ];
     this.log(`启动 ${found.label}：${found.executable}（端口 ${port}）`);
-    const child = spawn(found.executable, args, { detached: true, stdio: 'ignore' });
+    const child = spawn(found.executable, args, { detached: true, stdio: this.browserStdio() });
     child.unref();
     this.process = child;
     this.startedByUs = true;
     this.port = port;
+    this.childExit = null;
+    // 记下它**怎么退的**：退出码 0 = 用户自己关了窗口；非 0 = 崩了/被杀了。
+    // 区分得出来，才能「用户关的不再弹给他看，崩了的才自动恢复」。
+    child.on('exit', (code, signal) => {
+      this.childExit = { code, signal, at: Date.now() };
+      // 退出码 0 = **用户关掉了窗口**（干净退出）；非 0 = 崩了/被强杀。
+      // ⚠️ 只认「当前这个进程」的退出 —— 换了浏览器之后老进程的 exit 事件
+      //    还会晚到一步，别把它算到新浏览器头上。
+      if (this.process === child) {
+        this.userClosed = code === 0;
+        this.log(
+          `浏览器进程退出：code=${code} signal=${signal || '无'}`
+          + (code === 0 ? '（用户关掉了窗口）' : '（异常退出）'),
+        );
+      } else {
+        this.log(`旧的浏览器进程退出：code=${code} signal=${signal || '无'}`);
+      }
+    });
 
     let version;
     try {
       version = await waitForEndpoint(port, 25_000);
+      this.launchFailures = 0;
+      this.lastLaunchError = '';
     } catch (error) {
+      this.launchFailures += 1;
+      this.lastLaunchError = String((error && error.message) || error);
       // 我们起的这个进程可能只是「转发」给了一个**已经在跑**的浏览器
       // （同 profile 的单例行为）⇒ 真正在服务的那个才是我们要连的。
-      for (const running of this.findRunningPorts()) {
+      for (const running of await this.findRunningPorts()) {
         if (running === port) continue;
-        const attached = await this.tryAttach(running);
+        const attached = await this.tryAttach(running, { timeoutMs: 2000 });
         if (attached) {
           this.log(`新起的浏览器没开自己的调试端口（端口 ${port}），改连已经在跑的那个（端口 ${running}）`);
           this.startedByUs = false;
@@ -275,6 +386,7 @@ class ManagedBrowser {
           return attached;
         }
       }
+      this.log(`浏览器起不来（连续第 ${this.launchFailures} 次）：${this.lastLaunchError}`);
       throw error;
     }
     this.client = await CdpClient.connect(version.webSocketDebuggerUrl, { log: this.log });
