@@ -199,7 +199,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     if (tsfn) {
                         // NonBlocking:钩子回调必须尽快返回(LowLevelHooksTimeout)。
                         tsfn.NonBlockingCall([](Napi::Env env, Napi::Function cb) {
-                            cb.Call({Napi::Undefined::New(env)});
+                            // 回调不需要参数;传一个布尔占位
+                            // (⚠️ 不能写 `cb.Call({})` —— initializer_list 与 vector
+                            //  两个重载都接得住空花括号 ⇒ 重载决议不唯一,编译不过。)
+                            cb.Call({Napi::Boolean::New(env, true)});
                         });
                     }
                 }
